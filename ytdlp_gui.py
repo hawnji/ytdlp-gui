@@ -205,6 +205,7 @@ def make_ydl(opts):
         ydl.add_info_extractor(ie)
         key = ie.ie_key()
         ydl._ies = {key: ydl._ies.pop(key), **ydl._ies}
+    ydl.add_post_processor(RelayClipsPP(ydl), when='before_dl')
     return ydl
 
 
@@ -874,6 +875,145 @@ def _pick_stream(formats, want_video):
     return cands[0][-1]
 
 
+class _RangeRelay:
+    """Local HTTP relay for previews. FFmpeg asks for "bytes=N-" (everything from N on); hosts such as
+    YouTube refuse that with 403 and only serve bounded pieces. The relay fetches bounded pieces, as
+    yt-dlp's own downloader does, and streams them to FFmpeg, so seeking works normally."""
+    CHUNK = 2 << 20  # small pieces: a preview frame only needs a little data
+
+    def __init__(self):
+        self.streams = {}
+        self.server = None
+        self.lock = threading.Lock()
+
+    def register(self, url, headers, size=None, chunk=None):
+        import secrets
+        with self.lock:
+            if not self.server:
+                from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+                relay = self
+
+                class Handler(BaseHTTPRequestHandler):
+                    protocol_version = 'HTTP/1.1'
+
+                    def log_message(self, *a):
+                        pass
+
+                    def do_HEAD(self):
+                        relay._serve(self, head=True)
+
+                    def do_GET(self):
+                        relay._serve(self)
+
+                self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+                self.server.daemon_threads = True
+                threading.Thread(target=self.server.serve_forever, daemon=True).start()
+            token = secrets.token_hex(8)
+            self.streams[token] = {'url': url, 'headers': dict(headers or {}), 'size': size,
+                                   'chunk': chunk or self.CHUNK}
+            return f'http://127.0.0.1:{self.server.server_address[1]}/s/{token}'
+
+    def owns(self, url):
+        return bool(self.server) and url.startswith(f'http://127.0.0.1:{self.server.server_address[1]}/s/')
+
+    def _open(self, st, a, b):
+        import urllib.request
+        req = urllib.request.Request(st['url'], headers={**st['headers'], 'Range': f'bytes={a}-{b}'})
+        return urllib.request.urlopen(req, timeout=30, context=_https_context())
+
+    def _size(self, st):
+        if not st['size']:
+            with self._open(st, 0, 0) as r:
+                m = re.search(r'/(\d+)', r.headers.get('Content-Range') or '')
+                st['size'] = int(m.group(1)) if m else None
+        return st['size']
+
+    def _serve(self, h, head=False):
+        m = re.fullmatch(r'/s/(\w+)', h.path)
+        st = self.streams.get(m.group(1)) if m else None
+        if not st:
+            return h.send_error(404)
+        try:
+            size = self._size(st)
+        except Exception as e:
+            return h.send_error(502, str(e)[:200])
+        if not size:
+            return h.send_error(502, 'The video host did not report a size')
+        a, b, partial = 0, size - 1, False
+        rm = re.match(r'bytes=(\d*)-(\d*)', h.headers.get('Range') or '')
+        if rm and (rm.group(1) or rm.group(2)):
+            partial = True
+            if rm.group(1):
+                a = int(rm.group(1))
+                if rm.group(2):
+                    b = min(int(rm.group(2)), size - 1)
+            else:  # "bytes=-N": the last N bytes
+                a = max(0, size - int(rm.group(2)))
+        if a >= size:
+            h.send_response(416)
+            h.send_header('Content-Range', f'bytes */{size}')
+            h.send_header('Content-Length', '0')
+            h.end_headers()
+            return
+        h.send_response(206 if partial else 200)
+        h.send_header('Content-Type', 'application/octet-stream')
+        h.send_header('Accept-Ranges', 'bytes')
+        h.send_header('Content-Length', str(b - a + 1))
+        if partial:
+            h.send_header('Content-Range', f'bytes {a}-{b}/{size}')
+        h.end_headers()
+        if head:
+            return
+        pos = a
+        try:
+            while pos <= b:
+                end = min(b, pos + st['chunk'] - 1)
+                with self._open(st, pos, end) as r:
+                    while pos <= end:
+                        data = r.read(min(65536, end - pos + 1))
+                        if not data:
+                            break
+                        h.wfile.write(data)
+                        pos += len(data)
+                if pos <= end:
+                    break  # the host sent less than asked; stop instead of looping
+        except OSError:
+            pass  # FFmpeg hung up after getting what it needed, or the host failed
+
+
+_RANGE_RELAY = _RangeRelay()
+
+
+def _needs_relay(f):
+    """Streams whose host requires bounded range requests (yt-dlp marks these with a chunk size)."""
+    return bool((f.get('downloader_options') or {}).get('http_chunk_size')
+                and re.match(r'https?://', f.get('url') or ''))
+
+
+from yt_dlp.postprocessor.common import PostProcessor  # noqa: E402
+
+
+class RelayClipsPP(PostProcessor):
+    """Clipped downloads are fetched by FFmpeg, whose open-ended requests YouTube refuses with 403.
+    Right before such a download, point FFmpeg at the relay instead (same bounded pieces as yt-dlp)."""
+
+    def run(self, info):
+        if info.get('section_start') is None and not info.get('section_end'):
+            return [], info
+        for f in [info, *(info.get('requested_formats') or [])]:
+            if _needs_relay(f) and not _RANGE_RELAY.owns(f['url']):
+                headers = dict(f.get('http_headers') or info.get('http_headers') or {})
+                try:
+                    cookie = self._downloader.cookiejar.get_cookie_header(f['url'])
+                    if cookie:
+                        headers['Cookie'] = cookie
+                except Exception:
+                    pass
+                chunk = (f.get('downloader_options') or {}).get('http_chunk_size')
+                f['url'] = _RANGE_RELAY.register(f['url'], headers, f.get('filesize'), chunk=chunk)
+        return [], info
+
+
 def preview_source(url, settings):
     """Look up one video/song and pick streams for previewing (no download)."""
     opts = dict(yt_dlp.parse_options(build_args({**settings, 'clip_start': '', 'clip_end': ''})).ydl_opts)
@@ -901,6 +1041,8 @@ def preview_source(url, settings):
                     headers['Cookie'] = cookie
             except Exception:
                 pass
+            if _needs_relay(f):  # e.g. YouTube: FFmpeg's own requests would get 403 Forbidden
+                return _RANGE_RELAY.register(f['url'], headers, f.get('filesize')), {}
             return f['url'], headers
 
         formats = info.get('formats') or ([info] if info.get('url') else [])
