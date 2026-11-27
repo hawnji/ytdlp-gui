@@ -370,7 +370,8 @@ BROWSERS = ['None', 'chrome', 'firefox', 'edge', 'brave', 'opera', 'vivaldi', 's
 PLAYLIST_MODES = ['Whole playlist', 'Single video only']
 
 DEFAULTS = {
-    'outdir': os.path.join(os.path.expanduser('~'), 'Downloads'),
+    'outdir': os.path.join(os.path.expanduser('~'), 'Downloads'),   # video folder
+    'outdir_audio': '',  # audio folder ('' = same as the video folder; filled in on first run)
     'template': '%(title)s [%(id)s].%(ext)s',
     'mode': 'video',
     'quality': 'Best',
@@ -391,6 +392,7 @@ DEFAULTS = {
     'parallel': 3,
     'only_new': False,
     'watch_clipboard': False,
+    'clear_done': True,
     'preview_volume': 50.0,
     'clip_precise': True,
     'dark': True,
@@ -504,6 +506,13 @@ def open_path(path):
         messagebox.showerror(APP_NAME, f'Could not open:\n{path}\n\n{e}')
 
 
+def out_folder(s):
+    """The download folder for the current mode."""
+    if s.get('mode') == 'audio' and s.get('outdir_audio'):
+        return s['outdir_audio']
+    return s['outdir']
+
+
 class SettingsError(ValueError):
     """A setting the user needs to fix (shown as-is)."""
 
@@ -540,7 +549,7 @@ def build_args(s):
         args += ['--download-sections', f'*{start:g}-{end:g}' if end is not None else f'*{start:g}-inf']
         if s.get('clip_precise'):
             args += ['--force-keyframes-at-cuts']
-    args += ['-P', s['outdir'], '-o', template]
+    args += ['-P', out_folder(s), '-o', template]
 
     if s['mode'] == 'audio':
         args += ['-f', 'bestaudio/best', '-x']
@@ -618,8 +627,12 @@ class Worker(threading.Thread):
     """Runs downloads. `jobs` is a list of URLs, or of ('url', url, None) / ('entry', entry, extra) tuples
     (the latter is how failed playlist items are retried with their playlist numbering intact)."""
 
-    def __init__(self, jobs, args, q, parallel=1):
+    def __init__(self, jobs, args, q, parallel=1, args_whole=None, clip_confirmed=False):
         super().__init__(daemon=True)
+        # args_whole: the same settings without the clip, used if the user chooses to download a playlist whole
+        self.args_whole = args_whole
+        self._clip_choice = 'clip' if clip_confirmed else None
+        self._ask_lock = threading.Lock()
         self.jobs = [('url', j, None) if isinstance(j, str) else tuple(j) for j in jobs]
         self.args, self.q = args, q
         self.parallel = max(1, int(parallel or 1))
@@ -627,6 +640,8 @@ class Worker(threading.Thread):
         self.errors = 0
         self._lock = threading.Lock()
         self._tl = threading.local()
+        self._root = {}          # id(playlist item) -> the link it came from
+        self._failed_roots = set()
 
     @property
     def urls(self):
@@ -668,8 +683,23 @@ class Worker(threading.Thread):
             self.q.put(('done_item', {'key': key, 'path': info.get('filepath'),
                                       'url': info.get('webpage_url') or info.get('original_url')}))
 
-    def _opts(self):
-        opts = dict(yt_dlp.parse_options(self.args).ydl_opts)
+    def _clip_decision(self, n, title):
+        """A clip is set and a playlist turned out to have n items: ask the user once per run."""
+        if not self.args_whole:
+            return 'clip'
+        with self._ask_lock:
+            if self._clip_choice is None:
+                answer = threading.Event()
+                box = {}
+                self.q.put(('ask_clip', {'n': n, 'title': title, 'event': answer, 'box': box}))
+                while not answer.wait(0.2):
+                    if self.cancel.is_set():
+                        return 'cancel'
+                self._clip_choice = box.get('answer') or 'cancel'
+            return self._clip_choice
+
+    def _opts(self, args=None):
+        opts = dict(yt_dlp.parse_options(args or self.args).ydl_opts)
         opts['logger'] = GuiLogger(self.q, self._on_error)
         opts['progress_hooks'] = [self._hook]
         opts['postprocessor_hooks'] = [self._pp_hook]
@@ -728,7 +758,11 @@ class Worker(threading.Thread):
         add_total(len(self.jobs))
 
         def failed(kind, item, extra, info=None):
-            if kind == 'entry':
+            root = item if kind == 'url' else self._root.get(id(item))
+            if root:
+                with self._lock:
+                    self._failed_roots.add(root)
+            if kind in ('entry', 'entry_whole'):
                 key = item.get('id') or item.get('url')
                 title, url = item.get('title') or item.get('url'), item.get('url')
             else:
@@ -743,6 +777,15 @@ class Worker(threading.Thread):
                 self._on_error()
                 self.q.put(('log', f'ERROR: could not start yt-dlp: {e}'))
                 return
+            whole = {}  # a second YoutubeDL without the clip, made only if needed
+
+            def ydl_for(kind):
+                if kind != 'entry_whole':
+                    return ydl
+                if 'ydl' not in whole:
+                    whole['ydl'] = make_ydl(self._opts(self.args_whole))
+                return whole['ydl']
+
             with ydl:
                 while not stop.is_set():
                     try:
@@ -764,17 +807,28 @@ class Worker(threading.Thread):
                                     ydl.download([item])
                             elif entries:
                                 pl = entries[0][1].get('playlist') or item
+                                entry_kind = 'entry'
+                                if self.args_whole and len(entries) > 1:
+                                    choice = self._clip_decision(len(entries), pl)
+                                    if choice == 'cancel':
+                                        self.cancel.set()
+                                        continue
+                                    if choice == 'whole':
+                                        entry_kind = 'entry_whole'
                                 self.q.put(('log', f'Playlist "{pl}": {len(entries)} item(s), '
-                                                   f'{self.parallel} at a time'))
+                                                   f'{self.parallel} at a time'
+                                                   + (' — downloading whole, no clip' if entry_kind == 'entry_whole'
+                                                      else ' — clipping each' if self.args_whole else '')))
                                 for entry, ex in entries:
                                     if entry.get('id'):
                                         self.q.put(('queued', {'key': entry['id'], 'url': entry.get('url'),
                                                                'title': entry.get('title') or entry.get('url')}))
-                                    jobs.put(('entry', entry, ex))
+                                    self._root[id(entry)] = item
+                                    jobs.put((entry_kind, entry, ex))
                                 add_total(len(entries) - 1)  # the playlist itself was a placeholder
                                 continue
                         else:
-                            ydl.process_ie_result(dict(item), download=True, extra_info=extra)
+                            ydl_for(kind).process_ie_result(dict(item), download=True, extra_info=extra)
                         if getattr(self._tl, 'errors', 0) > before:
                             failed(kind, item, extra, info)
                         finish_one()
@@ -805,6 +859,9 @@ class Worker(threading.Thread):
             self._run_jobs(self._opts())
             if self.cancel.is_set():
                 raise DownloadCancelled('Cancelled by user')
+            roots = self.urls
+            self.q.put(('urls_done', {'done': [u for u in roots if u not in self._failed_roots],
+                                      'failed': [u for u in roots if u in self._failed_roots]}))
             ok = self.errors == 0
         except DownloadCancelled:
             self.q.put(('log', 'Download cancelled.'))
@@ -1905,6 +1962,7 @@ class App(tk.Tk):
         self.worker = None
         self.rows = {}
         self.settings = dict(DEFAULTS)
+        self._col_widths = {}
         self._load_settings()
         self.palette = PALETTES['dark' if self.settings.get('dark', True) else 'light']
         self._style()
@@ -2066,9 +2124,13 @@ class App(tk.Tk):
         ttk.Button(top, text='From file…', command=self._load_urls).grid(row=2, column=1, sticky='ew', padx=(8, 0))
         self.watch_clipboard = tk.BooleanVar()
         self.preview_volume = tk.DoubleVar()  # used by the Preview & clip window
-        ttk.Checkbutton(top, text='Watch clipboard — links you copy are added automatically',
-                        variable=self.watch_clipboard, command=self._on_watch_toggle).grid(
-            row=3, column=0, columnspan=2, sticky='w', pady=(6, 0))
+        self.clear_done = tk.BooleanVar()
+        opts_row = ttk.Frame(top)
+        opts_row.grid(row=3, column=0, columnspan=2, sticky='w', pady=(6, 0))
+        ttk.Checkbutton(opts_row, text='Watch clipboard — links you copy are added automatically',
+                        variable=self.watch_clipboard, command=self._on_watch_toggle).pack(side='left')
+        ttk.Checkbutton(opts_row, text='Clear links when finished (failed ones stay)',
+                        variable=self.clear_done).pack(side='left', padx=(20, 0))
 
         # Options
         opt = ttk.Frame(root)
@@ -2155,31 +2217,37 @@ class App(tk.Tk):
         out.pack(fill='x', pady=(8, 0))
         out.columnconfigure(1, weight=1)
         self.outdir = tk.StringVar()
+        self.outdir_audio = tk.StringVar()
         self.template = tk.StringVar()
         self.extra_args = tk.StringVar()
-        ttk.Label(out, text='Folder').grid(row=0, column=0, sticky='w')
-        ttk.Entry(out, textvariable=self.outdir).grid(row=0, column=1, sticky='ew', padx=6)
-        ttk.Button(out, text='Browse…', command=self._browse).grid(row=0, column=2)
-        ttk.Button(out, text='Open', command=lambda: self._open_outdir()).grid(row=0, column=3, padx=(4, 0))
-        ttk.Label(out, text='File name').grid(row=1, column=0, sticky='w', pady=4)
+        self.lbl_dirs = {}
+        for r, (mode, label, var) in enumerate((('video', 'Video folder', self.outdir),
+                                                 ('audio', 'Audio folder', self.outdir_audio))):
+            self.lbl_dirs[mode] = ttk.Label(out, text=label)
+            self.lbl_dirs[mode].grid(row=r, column=0, sticky='w', pady=(0, 3))
+            ttk.Entry(out, textvariable=var).grid(row=r, column=1, sticky='ew', padx=6, pady=(0, 3))
+            ttk.Button(out, text='Browse…', command=lambda v=var: self._browse(v)).grid(row=r, column=2, pady=(0, 3))
+            ttk.Button(out, text='Open', command=lambda v=var: self._open_outdir(v)).grid(
+                row=r, column=3, padx=(4, 0), pady=(0, 3))
+        ttk.Label(out, text='File name').grid(row=2, column=0, sticky='w', pady=4)
         ttk.Combobox(out, textvariable=self.template, values=[
             '%(title)s [%(id)s].%(ext)s',
             '%(title)s.%(ext)s',
             '%(uploader)s - %(title)s.%(ext)s',
             '%(playlist_title|Singles)s/%(playlist_index|)s%(playlist_index& - |)s%(title)s.%(ext)s',
             '%(uploader)s/%(upload_date>%Y-%m-%d)s - %(title)s.%(ext)s',
-        ]).grid(row=1, column=1, sticky='ew', padx=6, pady=4)
-        ttk.Label(out, text='Extra arguments').grid(row=2, column=0, sticky='w')
-        ttk.Entry(out, textvariable=self.extra_args).grid(row=2, column=1, sticky='ew', padx=6)
-        ttk.Button(out, text='Pick…', command=self._pick_args).grid(row=2, column=2, sticky='ew')
-        ttk.Button(out, text='Show command', command=self._show_cmd).grid(row=2, column=3, sticky='ew', padx=(4, 0))
+        ]).grid(row=2, column=1, sticky='ew', padx=6, pady=4)
+        ttk.Label(out, text='Extra arguments').grid(row=3, column=0, sticky='w')
+        ttk.Entry(out, textvariable=self.extra_args).grid(row=3, column=1, sticky='ew', padx=6)
+        ttk.Button(out, text='Pick…', command=self._pick_args).grid(row=3, column=2, sticky='ew')
+        ttk.Button(out, text='Show command', command=self._show_cmd).grid(row=3, column=3, sticky='ew', padx=(4, 0))
         self.clip_start = tk.StringVar()
         self.clip_end = tk.StringVar()
         self.clip_precise = tk.BooleanVar()
         self.lbl_clip = ttk.Label(out, text='Clip section')
-        self.lbl_clip.grid(row=3, column=0, sticky='w', pady=(4, 0))
+        self.lbl_clip.grid(row=4, column=0, sticky='w', pady=(4, 0))
         cf = ttk.Frame(out)
-        cf.grid(row=3, column=1, columnspan=3, sticky='w', padx=6, pady=(4, 0))
+        cf.grid(row=4, column=1, columnspan=3, sticky='w', padx=6, pady=(4, 0))
         ttk.Button(cf, text='Preview…', command=self._open_preview).pack(side='left', padx=(0, 10))
         ttk.Label(cf, text='Start').pack(side='left')
         ttk.Entry(cf, textvariable=self.clip_start, width=9).pack(side='left', padx=(4, 10))
@@ -2218,12 +2286,19 @@ class App(tk.Tk):
         tf = ttk.Frame(pane)
         cols = ('title', 'progress', 'size', 'speed', 'eta', 'status')
         self.tree = ttk.Treeview(tf, columns=cols, show='headings', height=7)
-        for c, w, anchor in (('title', 380, 'w'), ('progress', 80, 'e'), ('size', 90, 'e'),
-                             ('speed', 100, 'e'), ('eta', 60, 'e'), ('status', 130, 'w')):
+        for c, w, anchor in (('title', 420, 'w'), ('progress', 80, 'e'), ('size', 90, 'e'),
+                             ('speed', 100, 'e'), ('eta', 60, 'e'), ('status', 150, 'w')):
             self.tree.heading(c, text=c.capitalize() if c != 'eta' else 'ETA')
-            self.tree.column(c, width=w, anchor=anchor, stretch=(c == 'title'))
+            try:
+                w = max(40, int(self._col_widths.get(c, w)))
+            except (TypeError, ValueError):
+                pass
+            # only the last column soaks up spare room, so every other column keeps the width you drag it to
+            self.tree.column(c, width=w, minwidth=40, anchor=anchor, stretch=(c == 'status'))
         vs = ttk.Scrollbar(tf, orient='vertical', command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vs.set)
+        hs = ttk.Scrollbar(tf, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        hs.pack(side='bottom', fill='x')
         self.tree.pack(side='left', fill='both', expand=True)
         vs.pack(side='right', fill='y')
         self.tree.tag_configure('done', foreground='#1a7f37')
@@ -2258,9 +2333,13 @@ class App(tk.Tk):
     def _load_settings(self):
         try:
             with open(SETTINGS_PATH, encoding='utf-8') as f:
-                self.settings.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
+                data = json.load(f)
+            self.settings.update({k: v for k, v in data.items() if k in DEFAULTS})
+            self._col_widths = data.get('col_widths') or {}
         except Exception:
             pass
+        if not self.settings.get('outdir_audio'):
+            self.settings['outdir_audio'] = self.settings['outdir']
 
     def _apply_settings(self):
         for k, var in self._vars().items():
@@ -2292,8 +2371,13 @@ class App(tk.Tk):
 
     def _save_settings(self):
         try:
+            data = self._collect()
+            try:
+                data['col_widths'] = {c: int(self.tree.column(c, 'width')) for c in self.tree['columns']}
+            except Exception:
+                pass
             with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
-                json.dump(self._collect(), f, indent=2)
+                json.dump(data, f, indent=2)
         except Exception:
             pass
 
@@ -2306,6 +2390,9 @@ class App(tk.Tk):
             w.configure(state='disabled' if video else 'readonly')
         for w in (self.chk_subs, self.ent_langs, self.chk_chapters):
             w.configure(state='normal' if video else 'disabled')
+        # show which folder this download will go to
+        for mode, lbl in self.lbl_dirs.items():
+            lbl.configure(style='Active.TLabel' if mode == self.mode.get() else 'TLabel')
 
     def _paste(self):
         try:
@@ -2322,15 +2409,28 @@ class App(tk.Tk):
             with open(p, encoding='utf-8', errors='replace') as f:
                 self.url_text.insert('end', '\n' + f.read())
 
-    def _browse(self):
-        d = filedialog.askdirectory(initialdir=self.outdir.get() or os.path.expanduser('~'))
+    def _browse(self, var):
+        d = filedialog.askdirectory(initialdir=var.get() or os.path.expanduser('~'), parent=self)
         if d:
-            self.outdir.set(d)
+            var.set(d)
 
-    def _open_outdir(self):
-        d = self.outdir.get()
+    def _open_outdir(self, var=None):
+        d = (var.get() if var is not None else out_folder(self._collect())) or os.path.expanduser('~')
         os.makedirs(d, exist_ok=True)
         open_path(d)
+
+    def _remove_urls(self, urls):
+        """Take these links out of the URL box, leaving everything else (and anything added meanwhile)."""
+        gone = set(urls)
+        lines = self.url_text.get('1.0', 'end-1c').splitlines()
+        keep = [l for l in lines if l.strip() not in gone]
+        removed = len(lines) - len(keep)
+        if removed:
+            while keep and not keep[-1].strip():
+                keep.pop()
+            self.url_text.delete('1.0', 'end')
+            self.url_text.insert('1.0', '\n'.join(keep))
+        return removed
 
     def _urls(self):
         lines = self.url_text.get('1.0', 'end').splitlines()
@@ -2371,16 +2471,27 @@ class App(tk.Tk):
             messagebox.showinfo(APP_NAME, 'Paste at least one URL first.')
             return
         s = self._collect()
-        if not s['outdir']:
-            messagebox.showinfo(APP_NAME, 'Choose an output folder.')
+        if not out_folder(s):
+            messagebox.showinfo(APP_NAME, f"Choose a {'n audio' if s['mode'] == 'audio' else ' video'} folder first.")
             return
         try:
             args = build_args(s)
+            clip = clip_range(s)
+            args_whole = build_args({**s, 'clip_start': '', 'clip_end': ''}) if clip else None
         except ValueError as e:
             messagebox.showerror(APP_NAME, str(e) if isinstance(e, SettingsError)
                                  else f'Extra arguments could not be parsed:\n{e}')
             return
-        os.makedirs(s['outdir'], exist_ok=True)
+        clip_confirmed = bool(jobs)  # retries keep whatever was decided before
+        if clip and not jobs and len(urls) > 1:
+            choice = self._ask_clip_many(f'You have {len(urls)} links', clip)
+            if choice is None:
+                return
+            if choice:
+                clip_confirmed = True
+            else:
+                args, args_whole = args_whole, None  # download everything whole this time
+        os.makedirs(out_folder(s), exist_ok=True)
         self._save_settings()
         self.progress['value'] = 0
         self.btn_go.configure(state='disabled')
@@ -2393,8 +2504,20 @@ class App(tk.Tk):
         except (tk.TclError, ValueError):
             n = 1
         self._overall_total = 0
-        self.worker = Worker(urls, args, self.q, parallel=n)
+        self.worker = Worker(urls, args, self.q, parallel=n, args_whole=args_whole, clip_confirmed=clip_confirmed)
         self.worker.start()
+
+    def _ask_clip_many(self, what, clip):
+        """True = clip every item, False = download them whole, None = cancel."""
+        start, end = clip
+        section = f'{fmt_time(start)} → {fmt_time(end) if end is not None else "the end"}'
+        return messagebox.askyesnocancel(
+            'Clip every item?',
+            f'{what}, and a clip section is set ({section}).\n\n'
+            f'Yes  —  clip every item to {section}\n'
+            'No  —  download every item whole (ignore the clip this time)\n'
+            'Cancel  —  stop and change the settings',
+            icon='warning', default='no', parent=self)
 
     def _cancel(self):
         if self.worker and self.worker.is_alive():
@@ -2810,6 +2933,20 @@ class App(tk.Tk):
                     self.progress['value'] = 0
                     self.status.set('Update failed')
                     messagebox.showerror(APP_NAME, f'The update could not be downloaded:\n{data}', parent=self)
+                elif kind == 'ask_clip':
+                    try:
+                        clip = clip_range(self._collect()) or (0, None)
+                    except SettingsError:
+                        clip = (0, None)
+                    choice = self._ask_clip_many(f'"{data["title"]}" has {data["n"]} items', clip)
+                    data['box']['answer'] = 'clip' if choice else 'whole' if choice is False else 'cancel'
+                    data['event'].set()
+                elif kind == 'urls_done':
+                    if self.clear_done.get() and data['done']:
+                        n = self._remove_urls(data['done'])
+                        if n:
+                            self._log(f'Cleared {n} finished link(s) from the list'
+                                      + (f"; {len(data['failed'])} with failures kept" if data['failed'] else ''))
                 elif kind == 'finished':
                     self.btn_go.configure(state='normal')
                     self.btn_cancel.configure(state='disabled')
