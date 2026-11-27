@@ -55,6 +55,88 @@ except ImportError:
         '(next to the "yt_dlp" folder), or install it with:\n\npip install yt-dlp')
     sys.exit(1)
 
+import re
+from yt_dlp.extractor.common import InfoExtractor
+from yt_dlp.utils import ExtractorError, float_or_none, parse_iso8601, url_or_none
+
+
+class SunoIE(InfoExtractor):
+    """Suno songs. yt-dlp deliberately ships without Suno support, so the GUI adds it."""
+    IE_NAME = 'suno'
+    _VALID_URL = r'https?://(?:www\.|app\.)?suno\.com/(?:song|s|embed)/(?P<id>[\w-]+)'
+    _UUID_RE = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    _API = 'https://studio-api.prod.suno.com/api/clip/'
+
+    def _real_extract(self, url):
+        song_id = self._match_id(url)
+        webpage = None
+        if not re.fullmatch(self._UUID_RE, song_id):  # short share link: suno.com/s/XXXX
+            webpage, urlh = self._download_webpage_handle(url, song_id, 'Resolving share link')
+            m = (re.search(self._UUID_RE, urlh.url)
+                 or re.search(rf'/song/({self._UUID_RE})', webpage)
+                 or re.search(rf'image_large_({self._UUID_RE})', webpage))
+            if not m:
+                raise ExtractorError('Could not find a song in this Suno link', expected=True)
+            song_id = m.group(m.lastindex or 0)
+
+        clip = self._download_json(self._API + song_id, song_id, 'Downloading song info', fatal=False) or {}
+        meta = clip.get('metadata') or {}
+
+        formats = []
+        audio = url_or_none(clip.get('audio_url'))
+        if audio and 'forbidden' in audio:
+            audio = None
+        for a in dict.fromkeys(filter(None, (audio, f'https://cdn1.suno.ai/{song_id}.mp3'))):
+            if self._is_valid_url(a, song_id, 'MP3 audio'):
+                formats.append({'format_id': 'mp3', 'url': a, 'ext': 'mp3',
+                                'vcodec': 'none', 'acodec': 'mp3', 'quality': 1})
+                break
+        video = url_or_none(clip.get('video_url')) or f'https://cdn1.suno.ai/{song_id}.mp4'
+        if self._is_valid_url(video, song_id, 'MP4 video'):
+            formats.append({'format_id': 'mp4', 'url': video, 'ext': 'mp4',
+                            'vcodec': 'h264', 'acodec': 'aac', 'quality': 0})
+        if not formats:
+            raise ExtractorError('Suno did not offer a downloadable file for this song '
+                                 '(it may be private, deleted or still generating)', expected=True)
+
+        title = clip.get('title')
+        if not title:
+            webpage = webpage or self._download_webpage(f'https://suno.com/song/{song_id}', song_id, fatal=False)
+            title = (webpage and self._og_search_title(webpage, default=None)) or song_id
+        handle = clip.get('handle')
+        artist = clip.get('display_name') or handle
+        return {
+            'id': song_id,
+            'title': title,
+            'track': title,
+            'formats': formats,
+            'thumbnail': (url_or_none(clip.get('image_large_url'))
+                          or f'https://cdn2.suno.ai/image_large_{song_id}.jpeg'),
+            'uploader': artist,
+            'uploader_id': handle,
+            'uploader_url': f'https://suno.com/@{handle}' if handle else None,
+            'artists': [artist] if artist else None,
+            'duration': float_or_none(meta.get('duration')),
+            'timestamp': parse_iso8601(clip.get('created_at')),
+            'description': meta.get('tags'),
+            'webpage_url': f'https://suno.com/song/{song_id}',
+        }
+
+
+EXTRA_EXTRACTORS = (SunoIE,)
+
+
+def make_ydl(opts):
+    """A YoutubeDL with the GUI's own extractors placed ahead of yt-dlp's (and its block list)."""
+    ydl = yt_dlp.YoutubeDL(opts)
+    for cls in reversed(EXTRA_EXTRACTORS):
+        ie = cls()
+        ydl.add_info_extractor(ie)
+        key = ie.ie_key()
+        ydl._ies = {key: ydl._ies.pop(key), **ydl._ies}
+    return ydl
+
+
 APP_NAME = 'yt-dlp GUI'
 SETTINGS_PATH = os.path.join(os.path.expanduser('~'), '.ytdlp_gui.json')
 
@@ -373,7 +455,7 @@ class Worker(threading.Thread):
 
         def worker():
             try:
-                ydl = yt_dlp.YoutubeDL(dict(base_opts))
+                ydl = make_ydl(dict(base_opts))
             except Exception as e:
                 self._on_error()
                 self.q.put(('log', f'ERROR: could not start yt-dlp: {e}'))
@@ -449,7 +531,7 @@ class Worker(threading.Thread):
                     raise DownloadCancelled('Cancelled by user')
                 self.q.put(('finished', self.errors == 0))
                 return
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            with make_ydl(opts) as ydl:
                 for url in self.urls:
                     if self.cancel.is_set():
                         break
