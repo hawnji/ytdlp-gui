@@ -123,7 +123,43 @@ class SunoIE(InfoExtractor):
         }
 
 
-EXTRA_EXTRACTORS = (SunoIE,)
+class SunoPlaylistIE(InfoExtractor):
+    """Suno playlists: suno.com/playlist/<id> — each song is handed to SunoIE."""
+    IE_NAME = 'suno:playlist'
+    _VALID_URL = r'https?://(?:www\.|app\.)?suno\.com/playlist/(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+    _API = 'https://studio-api.prod.suno.com/api/playlist/'
+
+    def _real_extract(self, url):
+        playlist_id = self._match_id(url)
+        info, entries, seen = {}, [], set()
+        for page in range(1, 101):
+            data = self._download_json(f'{self._API}{playlist_id}/', playlist_id,
+                                       f'Downloading playlist page {page}', query={'page': page})
+            if page == 1:
+                info = data
+            clips = [(item or {}).get('clip') or {} for item in data.get('playlist_clips') or []]
+            new = [c for c in clips if c.get('id') and c['id'] not in seen]
+            for c in new:
+                seen.add(c['id'])
+                entries.append(self.url_result(
+                    f'https://suno.com/song/{c["id"]}', SunoIE, c['id'], c.get('title'),
+                    duration=float_or_none((c.get('metadata') or {}).get('duration')),
+                    uploader=c.get('display_name')))
+            total = data.get('num_total_results')
+            if not new or (total and len(entries) >= total):
+                break
+        if not entries:
+            raise ExtractorError('This Suno playlist is empty, private or deleted', expected=True)
+        handle = info.get('user_handle')
+        return self.playlist_result(
+            entries, playlist_id, info.get('name'), info.get('description') or None,
+            thumbnail=url_or_none(info.get('image_url')),
+            uploader=info.get('user_display_name') or handle, uploader_id=handle,
+            uploader_url=f'https://suno.com/@{handle}' if handle else None,
+            webpage_url=f'https://suno.com/playlist/{playlist_id}')
+
+
+EXTRA_EXTRACTORS = (SunoIE, SunoPlaylistIE)
 
 
 def make_ydl(opts):
