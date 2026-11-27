@@ -391,6 +391,7 @@ DEFAULTS = {
     'parallel': 3,
     'only_new': False,
     'watch_clipboard': False,
+    'preview_volume': 50.0,
     'dark': True,
 }
 
@@ -1105,10 +1106,11 @@ def render_waveform(src, width, height, color='#d97757'):
                         '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'], timeout=180)
 
 
-def audio_snippet(src, t, seconds, path):
-    """Write `seconds` of audio starting at t to a WAV file."""
-    _run_ffmpeg(['-y', *_ff_input(src, t), '-t', f'{seconds:.2f}', '-vn', '-ac', '2', '-ar', '44100',
-                 '-c:a', 'pcm_s16le', path], timeout=60)
+def audio_snippet(src, t, seconds, path, volume=1.0):
+    """Write `seconds` of audio starting at t to a WAV file, at `volume` (0..1, perceptual)."""
+    gain = max(0.0, min(1.0, volume)) ** 2  # squared so the slider feels even to the ear
+    _run_ffmpeg(['-y', *_ff_input(src, t), '-t', f'{seconds:.2f}', '-vn', '-af', f'volume={gain:.4f}',
+                 '-ac', '2', '-ar', '44100', '-c:a', 'pcm_s16le', path], timeout=60)
     return path
 
 
@@ -1127,7 +1129,7 @@ class PreviewWindow(tk.Toplevel):
         self.title('Preview & clip')
         self.configure(bg=p['bg'])
         self.transient(app)
-        self.minsize(720, 560)
+        self.minsize(900, 560)
         self._resize_job = None
         self._frame_job = None
         self._strip_gen = 0
@@ -1188,12 +1190,12 @@ class PreviewWindow(tk.Toplevel):
 
         ctl = ttk.Frame(outer)
         ctl.grid(row=4, column=0, sticky='ew', pady=(8, 0))
-        for text, d in (('−5s', -5), ('−1s', -1)):
-            ttk.Button(ctl, text=text, width=4, command=lambda d=d: self._nudge(d)).pack(side='left', padx=(0, 3))
-        self.lbl_time = ttk.Label(ctl, text='0:00', style='Head.TLabel', width=12, anchor='center')
+        for text, d in (('−5s', -5), ('−1s', -1), ('−0.1s', -0.1)):
+            ttk.Button(ctl, text=text, width=5, command=lambda d=d: self._nudge(d)).pack(side='left', padx=(0, 3))
+        self.lbl_time = ttk.Label(ctl, text='0:00', style='Head.TLabel', width=10, anchor='center')
         self.lbl_time.pack(side='left', padx=4)
-        for text, d in (('+1s', 1), ('+5s', 5)):
-            ttk.Button(ctl, text=text, width=4, command=lambda d=d: self._nudge(d)).pack(side='left', padx=(3, 0))
+        for text, d in (('+0.1s', 0.1), ('+1s', 1), ('+5s', 5)):
+            ttk.Button(ctl, text=text, width=5, command=lambda d=d: self._nudge(d)).pack(side='left', padx=(3, 0))
         ttk.Button(ctl, text='Set start  [', command=self._set_start).pack(side='left', padx=(16, 3))
         ttk.Button(ctl, text='Set end  ]', command=self._set_end).pack(side='left', padx=3)
         self.btn_stop = ttk.Button(ctl, text='■', width=3, command=self._stop_sound)
@@ -1201,6 +1203,15 @@ class PreviewWindow(tk.Toplevel):
         if self._winsound:
             self.btn_stop.pack(side='right')
             self.btn_hear.pack(side='right', padx=(0, 3))
+            vol = app.preview_volume
+            self.lbl_vol = ttk.Label(ctl, width=5, anchor='e')
+            ttk.Scale(ctl, from_=0, to=100, orient='horizontal', length=110, variable=vol,
+                      command=self._on_volume, style='Seek.Horizontal.TScale').pack(side='right', padx=(0, 10))
+            self.lbl_vol.pack(side='right')
+            ttk.Label(ctl, text='Volume').pack(side='right', padx=(10, 4))
+            self._vol_job = None
+            self._playing_from = None
+            self._show_volume()
 
         bot = ttk.Frame(outer)
         bot.grid(row=5, column=0, sticky='ew', pady=(10, 0))
@@ -1210,7 +1221,7 @@ class PreviewWindow(tk.Toplevel):
         ttk.Button(bot, text='Cancel', command=self._close).pack(side='right', padx=6)
         ttk.Button(bot, text='Clear', command=self._clear).pack(side='right')
         self.lbl_hint = ttk.Label(outer, style='Hint.TLabel',
-                                  text='Click or drag on the timeline · ←/→ 1 s · Shift+←/→ 5 s · [ ] set start/end'
+                                  text='Click or drag on the timeline · ←/→ 1 s · Shift 5 s · Ctrl 0.1 s · [ ] set start/end'
                                        + (' · Space to hear' if self._winsound else '')
                                        + ' · Make the window bigger for a finer timeline')
         self.lbl_hint.grid(row=6, column=0, sticky='w', pady=(6, 0))
@@ -1219,6 +1230,8 @@ class PreviewWindow(tk.Toplevel):
         self.bind('<Right>', lambda e: self._nudge(1))
         self.bind('<Shift-Left>', lambda e: self._nudge(-5))
         self.bind('<Shift-Right>', lambda e: self._nudge(5))
+        self.bind('<Control-Left>', lambda e: self._nudge(-0.1))
+        self.bind('<Control-Right>', lambda e: self._nudge(0.1))
         self.bind('[', lambda e: self._set_start())
         self.bind(']', lambda e: self._set_end())
         self.bind('<space>', lambda e: self._hear())
@@ -1308,6 +1321,7 @@ class PreviewWindow(tk.Toplevel):
                     try:
                         w = self._winsound
                         w.PlaySound(item[1], w.SND_FILENAME | w.SND_ASYNC | w.SND_NODEFAULT)
+                        self._playing_from, self._playing_until = item[2], time.time() + 5
                     except Exception as e:
                         self.lbl_sel.configure(text=f'Could not play audio: {e}')
                 elif kind == 'snip_error':
@@ -1512,7 +1526,7 @@ class PreviewWindow(tk.Toplevel):
             self._seek(float(value), live=True)
 
     def _nudge(self, d):
-        self._seek(self.t + d, now=True)
+        self._seek(round(self.t + d, 2), now=True)
 
     def _fetch_frame(self):
         self._debounce = None
@@ -1548,26 +1562,49 @@ class PreviewWindow(tk.Toplevel):
         self._update_labels()
 
     # ---- listening ----
-    def _hear(self):
+    def _volume(self):
+        try:
+            return max(0.0, min(100.0, float(self.app.preview_volume.get()))) / 100
+        except (tk.TclError, ValueError):
+            return 0.5
+
+    def _show_volume(self):
+        self.lbl_vol.configure(text=f'{round(self._volume() * 100)}%')
+
+    def _on_volume(self, _value=None):
+        self._show_volume()
+        # if a snippet is playing, replay it from the same spot at the new volume (once the slider settles)
+        if self._playing_from is not None and time.time() < self._playing_until:
+            if self._vol_job:
+                self.after_cancel(self._vol_job)
+            self._vol_job = self.after(300, lambda: self._hear(start=self._playing_from))
+
+    def _hear(self, start=None):
         if not self._winsound or not self.src or not self.duration:
             return
         s = self.src['audio'] or self.src['video']
         if not s:
             return
+        self._vol_job = None
         self._stop_sound()
+        vol = self._volume()
+        if vol <= 0:
+            self.lbl_sel.configure(text='Volume is at 0% — turn it up to hear the audio')
+            return
         self.btn_hear.configure(text='…')
         self._snip_n += 1
         path = os.path.join(self._tmp, f'snip{self._snip_n}.wav')
-        t = self.t
+        t = self.t if start is None else start
 
         def work():
             try:
-                return ('snip', audio_snippet(s, t, 5, path))
+                return ('snip', audio_snippet(s, t, 5, path, vol), t)
             except Exception as e:
                 return ('snip_error', str(e))
         self._bg(work)
 
     def _stop_sound(self):
+        self._playing_from = None
         if self._winsound:
             try:
                 self._winsound.PlaySound(None, 0)
@@ -1587,7 +1624,7 @@ class PreviewWindow(tk.Toplevel):
 
     def _close(self):
         self._closed = True
-        for job in (self._resize_job, self._frame_job, self._debounce):
+        for job in (self._resize_job, self._frame_job, self._debounce, getattr(self, '_vol_job', None)):
             if job:
                 try:
                     self.after_cancel(job)
@@ -1595,6 +1632,10 @@ class PreviewWindow(tk.Toplevel):
                     pass
         self._stop_sound()
         shutil.rmtree(self._tmp, ignore_errors=True)
+        try:
+            self.app._save_settings()
+        except Exception:
+            pass
         self.destroy()
 
 
@@ -2009,6 +2050,7 @@ class App(tk.Tk):
             row=1, column=1, sticky='ew', padx=(8, 0), pady=4)
         ttk.Button(top, text='From file…', command=self._load_urls).grid(row=2, column=1, sticky='ew', padx=(8, 0))
         self.watch_clipboard = tk.BooleanVar()
+        self.preview_volume = tk.DoubleVar()  # used by the Preview & clip window
         ttk.Checkbutton(top, text='Watch clipboard — links you copy are added automatically',
                         variable=self.watch_clipboard, command=self._on_watch_toggle).grid(
             row=3, column=0, columnspan=2, sticky='w', pady=(6, 0))
