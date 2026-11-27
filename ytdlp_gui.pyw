@@ -84,6 +84,7 @@ DEFAULTS = {
     'rate_limit': '',
     'extra_args': '',
     'skip_existing': True,
+    'parallel': 3,
     'dark': True,
 }
 
@@ -244,8 +245,9 @@ def build_args(s):
 
 
 class GuiLogger:
-    def __init__(self, q):
+    def __init__(self, q, on_error=None):
         self.q = q
+        self.on_error = on_error
 
     def debug(self, msg):
         # yt-dlp routes normal [info] messages through debug(); hide true debug noise
@@ -262,14 +264,25 @@ class GuiLogger:
         self.q.put(('log', 'WARNING: ' + msg))
 
     def error(self, msg):
+        if self.on_error:
+            self.on_error()
         self.q.put(('log', msg))
 
 
 class Worker(threading.Thread):
-    def __init__(self, urls, args, q):
+    def __init__(self, urls, args, q, parallel=1):
         super().__init__(daemon=True)
         self.urls, self.args, self.q = urls, args, q
+        self.parallel = max(1, int(parallel or 1))
         self.cancel = threading.Event()
+        self.errors = 0
+        self._lock = threading.Lock()
+        self._tl = threading.local()
+
+    def _on_error(self):
+        with self._lock:
+            self.errors += 1
+        self._tl.errors = getattr(self._tl, 'errors', 0) + 1
 
     def _hook(self, d):
         if self.cancel.is_set():
@@ -300,16 +313,142 @@ class Worker(threading.Thread):
         elif d.get('status') == 'finished' and d.get('postprocessor') == 'MoveFiles':
             self.q.put(('done_item', {'key': key, 'path': info.get('filepath')}))
 
+    def _opts(self):
+        opts = dict(yt_dlp.parse_options(self.args).ydl_opts)
+        opts['logger'] = GuiLogger(self.q, self._on_error)
+        opts['progress_hooks'] = [self._hook]
+        opts['postprocessor_hooks'] = [self._pp_hook]
+        opts['noprogress'] = True
+        opts['quiet'] = False
+        return opts
+
+    # ---- parallel mode: each thread has its own YoutubeDL; playlists are split into items ----
+    def _expand(self, ydl, url):
+        """Return a list of jobs for a URL: either playlist items, or None to process `info` directly."""
+        info = ydl.extract_info(url, download=False, process=False)
+        for _ in range(10):  # follow redirect-style results (short links, channel -> videos tab)
+            if not info or info.get('_type') not in ('url', 'url_transparent'):
+                break
+            info = ydl.extract_info(info['url'], download=False, process=False, ie_key=info.get('ie_key'))
+        if not info:
+            return [], None
+        if info.get('_type') not in ('playlist', 'multi_video') or ydl.params.get('lazy_playlist'):
+            return None, info
+        ydl.params['extract_flat'] = 'in_playlist'
+        try:
+            res = ydl.process_ie_result(info, download=False)
+        finally:
+            ydl.params.pop('extract_flat', None)
+        if not res:
+            return [], None
+        entries = list(res.get('entries') or [])
+        if any((e or {}).get('_type') not in ('url', 'url_transparent') for e in entries):
+            return None, None  # unusual playlist: let yt-dlp download it in one go
+        indices = res.get('requested_entries') or list(range(1, len(entries) + 1))
+        common = yt_dlp.YoutubeDL._playlist_infodict(res, n_entries=len(entries))
+        jobs = []
+        for n, (idx, entry) in enumerate(zip(indices, entries), 1):
+            extra = {**common, 'playlist_index': idx, 'playlist_autonumber': n}
+            jobs.append((dict(entry), extra))
+        return jobs, None
+
+    def _run_parallel(self, base_opts):
+        jobs = queue.Queue()
+        stop = threading.Event()
+        counts = {'total': 0, 'done': 0}
+
+        def add_total(n):
+            with self._lock:
+                counts['total'] += n
+            self.q.put(('overall', dict(counts)))
+
+        def finish_one():
+            with self._lock:
+                counts['done'] += 1
+            self.q.put(('overall', dict(counts)))
+
+        for url in self.urls:
+            jobs.put(('url', url, None))
+        add_total(len(self.urls))
+
+        def worker():
+            try:
+                ydl = yt_dlp.YoutubeDL(dict(base_opts))
+            except Exception as e:
+                self._on_error()
+                self.q.put(('log', f'ERROR: could not start yt-dlp: {e}'))
+                return
+            with ydl:
+                while not stop.is_set():
+                    try:
+                        kind, item, extra = jobs.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    try:
+                        if self.cancel.is_set():
+                            continue
+                        if kind == 'url':
+                            self.q.put(('log', f'=== {item}'))
+                            entries, info = self._expand(ydl, item)
+                            if entries is None:
+                                if info is not None:
+                                    ydl.process_ie_result(info, download=True)
+                                else:
+                                    ydl.download([item])
+                            else:
+                                if entries:
+                                    pl = entries[0][1].get('playlist') or item
+                                    self.q.put(('log', f'Playlist "{pl}": {len(entries)} items, '
+                                                       f'{self.parallel} at a time'))
+                                for entry, ex in entries:
+                                    if entry.get('id'):
+                                        self.q.put(('queued', {'key': entry['id'],
+                                                               'title': entry.get('title') or entry['url']}))
+                                    jobs.put(('entry', entry, ex))
+                                add_total(len(entries))
+                                with self._lock:  # the playlist itself was a placeholder
+                                    counts['total'] -= 1
+                                self.q.put(('overall', dict(counts)))
+                                continue
+                        else:
+                            before = getattr(self._tl, 'errors', 0)
+                            ydl.process_ie_result(item, download=True, extra_info=extra)
+                            if getattr(self._tl, 'errors', 0) > before and item.get('id'):
+                                self.q.put(('item_error', {'key': item['id']}))
+                        finish_one()
+                    except DownloadCancelled:
+                        self.cancel.set()
+                    except Exception as e:
+                        if not str(e).startswith('ERROR'):  # yt-dlp errors were already logged
+                            self._on_error()
+                            self.q.put(('log', f'ERROR: {e}'))
+                        key = item.get('id') if isinstance(item, dict) else None
+                        if key:
+                            self.q.put(('item_error', {'key': key}))
+                        finish_one()
+                    finally:
+                        jobs.task_done()
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(self.parallel)]
+        for t in threads:
+            t.start()
+        # wait until every job is done, or every thread has died (never hang)
+        while jobs.unfinished_tasks and any(t.is_alive() for t in threads):
+            time.sleep(0.2)
+        stop.set()
+        for t in threads:
+            t.join()
+
     def run(self):
         ok = True
         try:
-            parsed = yt_dlp.parse_options(self.args)
-            opts = parsed.ydl_opts
-            opts['logger'] = GuiLogger(self.q)
-            opts['progress_hooks'] = [self._hook]
-            opts['postprocessor_hooks'] = [self._pp_hook]
-            opts['noprogress'] = True
-            opts['quiet'] = False
+            opts = self._opts()
+            if self.parallel > 1:
+                self._run_parallel(opts)
+                if self.cancel.is_set():
+                    raise DownloadCancelled('Cancelled by user')
+                self.q.put(('finished', self.errors == 0))
+                return
             with yt_dlp.YoutubeDL(opts) as ydl:
                 for url in self.urls:
                     if self.cancel.is_set():
@@ -635,7 +774,7 @@ class App(tk.Tk):
                background=[('disabled', p['surface']), ('pressed', p['accent_hover']), ('active', p['accent_hover'])],
                foreground=[('disabled', p['disabled'])],
                lightcolor=[('active', p['accent_hover'])], darkcolor=[('active', p['accent_hover'])])
-        for w in ('TEntry', 'TCombobox'):
+        for w in ('TEntry', 'TCombobox', 'TSpinbox'):
             st.configure(w, fieldbackground=p['field'], foreground=p['fg'], bordercolor=p['border'],
                          lightcolor=p['field'], darkcolor=p['field'], background=p['surface'])
             st.map(w, fieldbackground=[('disabled', p['bg']), ('readonly', p['field'])],
@@ -803,6 +942,10 @@ class App(tk.Tk):
             row=4, column=1, sticky='w', pady=2)
         ttk.Label(ext, text='Speed limit (e.g. 2M)').grid(row=5, column=0, sticky='w')
         ttk.Entry(ext, textvariable=self.rate_limit, width=20).grid(row=5, column=1, sticky='w')
+        self.parallel = tk.IntVar()
+        ttk.Label(ext, text='Simultaneous downloads').grid(row=6, column=0, sticky='w', pady=(2, 0))
+        ttk.Spinbox(ext, from_=1, to=10, textvariable=self.parallel, width=6, state='readonly',
+                    wrap=False).grid(row=6, column=1, sticky='w', pady=(2, 0))
 
         # -- Output
         out = ttk.LabelFrame(root, text='Output', padding=8)
@@ -987,7 +1130,12 @@ class App(tk.Tk):
         self.btn_cancel.configure(state='normal')
         self.status.set(f'Downloading {len(urls)} link(s)…')
         self._started = time.time()
-        self.worker = Worker(urls, args, self.q)
+        try:
+            n = max(1, min(10, int(self.parallel.get())))
+        except (tk.TclError, ValueError):
+            n = 1
+        self.parallel_on = n > 1
+        self.worker = Worker(urls, args, self.q, parallel=n)
         self.worker.start()
 
     def _cancel(self):
@@ -1044,6 +1192,17 @@ class App(tk.Tk):
                 kind, data = self.q.get_nowait()
                 if kind == 'log':
                     self._log(data)
+                elif kind == 'queued':
+                    iid = self._row(data['key'], data['title'])
+                    self.tree.set(iid, 'status', 'Queued')
+                elif kind == 'item_error':
+                    iid = self._row(data['key'])
+                    self.tree.set(iid, 'status', 'Error')
+                    self.tree.item(iid, tags=('err',))
+                elif kind == 'overall':
+                    if data['total']:
+                        self.progress['value'] = data['done'] / data['total'] * 100
+                        self.status.set(f"Downloading… {data['done']} of {data['total']} done")
                 elif kind == 'progress':
                     iid = self._row(data['key'], data['title'])
                     st = data['status']
@@ -1057,7 +1216,7 @@ class App(tk.Tk):
                         self.tree.set(iid, 'speed', data['speed'])
                         self.tree.set(iid, 'eta', data['eta'])
                         self.tree.set(iid, 'status', 'Downloading')
-                        if pct is not None:
+                        if pct is not None and not self.parallel_on:
                             self.progress['value'] = pct
                     elif st == 'finished':
                         self.tree.set(iid, 'progress', '100%')
@@ -1093,6 +1252,8 @@ class App(tk.Tk):
                         if self.tree.set(iid, 'status') not in ('✔ Done', 'Error'):
                             if data is None:
                                 self.tree.set(iid, 'status', 'Cancelled')
+                            elif self.tree.set(iid, 'status') == 'Queued':
+                                self.tree.set(iid, 'status', 'Skipped')
                             elif self.tree.set(iid, 'status') == 'Downloaded':
                                 self.tree.set(iid, 'status', '✔ Done')
                                 self.tree.item(iid, tags=('done',))
