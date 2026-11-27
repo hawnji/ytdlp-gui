@@ -84,7 +84,84 @@ DEFAULTS = {
     'rate_limit': '',
     'extra_args': '',
     'skip_existing': True,
+    'dark': True,
 }
+
+# Colours matched to Claude's dark and light themes
+PALETTES = {
+    'dark': {
+        'bg': '#262624', 'surface': '#30302e', 'hover': '#3a3a37', 'field': '#1f1e1d',
+        'border': '#3e3e38', 'fg': '#ece9e0', 'muted': '#a3a198', 'disabled': '#6b6a64',
+        'accent': '#d97757', 'accent_hover': '#c6613f', 'on_accent': '#1f1e1d',
+        'select': '#57392c', 'ok': '#7fbf7f', 'err': '#ff8a7a', 'warn': '#e3b341',
+    },
+    'light': {
+        'bg': '#f5f4ee', 'surface': '#ffffff', 'hover': '#ebe9e1', 'field': '#ffffff',
+        'border': '#d6d3c7', 'fg': '#1f1e1d', 'muted': '#6b6a64', 'disabled': '#a3a198',
+        'accent': '#d97757', 'accent_hover': '#c6613f', 'on_accent': '#ffffff',
+        'select': '#f3d9cd', 'ok': '#1a7f37', 'err': '#cf222e', 'warn': '#9a6700',
+    },
+}
+
+# Options that make no sense inside the GUI
+PICKER_SKIP = {'--help', '--version', '--update', '--no-update', '--update-to',
+               '--newline', '--no-newline', '--color', '--no-colors', '--quiet', '--no-quiet',
+               '--progress', '--no-progress', '--console-title', '--progress-template',
+               '--progress-delta', '--simulate', '--no-simulate', '--dump-json',
+               '--dump-single-json', '--list-extractors', '--extractor-descriptions'}
+
+
+def split_args(s):
+    """Split an argument string like a shell, but keep backslashes (Windows paths)."""
+    lex = shlex.shlex(s, posix=True)
+    lex.whitespace_split = True
+    lex.escape = ''
+    lex.commenters = ''
+    return list(lex)
+
+
+def quote_arg(a):
+    if a and not any(c.isspace() or c in '"\'' for c in a):
+        return a
+    return "'" + a + "'" if '"' in a else '"' + a + '"'
+
+
+_CLI_OPTIONS = None
+
+
+def get_cli_options():
+    """Every yt-dlp command-line option, read from yt-dlp's own parser."""
+    global _CLI_OPTIONS
+    if _CLI_OPTIONS is None:
+        import optparse
+        from yt_dlp.options import create_parser
+        p = create_parser()
+        p.formatter.parser = p
+        groups = []
+        for g in p.option_groups:
+            opts = []
+            for o in g.option_list:
+                if o.help == optparse.SUPPRESS_HELP or not o._long_opts:
+                    continue
+                name = o._long_opts[0]
+                if name in PICKER_SKIP:
+                    continue
+                try:
+                    text = p.formatter.expand_default(o)
+                except Exception:
+                    text = o.help or ''
+                opts.append({
+                    'name': name,
+                    'aliases': o._short_opts + o._long_opts,
+                    'takes_value': o.takes_value(),
+                    'nargs': o.nargs or 1,
+                    'metavar': o.metavar or 'VALUE',
+                    'help': ' '.join((text or '').split()),
+                })
+            if opts:
+                groups.append((g.title, opts))
+        _CLI_OPTIONS = groups
+    return _CLI_OPTIONS
 
 
 def human_bytes(n):
@@ -162,7 +239,7 @@ def build_args(s):
     if not s['skip_existing']:
         args += ['--force-overwrites']
     if s['extra_args'].strip():
-        args += shlex.split(s['extra_args'], posix=not sys.platform.startswith('win'))
+        args += split_args(s['extra_args'])
     return args
 
 
@@ -259,6 +336,246 @@ class Worker(threading.Thread):
         self.q.put(('finished', ok))
 
 
+class ArgPicker(tk.Toplevel):
+    """Checkbox list of every yt-dlp option, written back into 'Extra arguments'."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title('Pick yt-dlp options')
+        self.geometry('900x640')
+        self.minsize(640, 460)
+        self.transient(app)
+        pal = app.palette
+        self.configure(bg=pal['bg'])
+
+        self.groups = get_cli_options()
+        self.by_alias = {}
+        self.state = {}
+        for _title, opts in self.groups:
+            for o in opts:
+                self.state[o['name']] = {'on': False, 'value': ''}
+                for a in o['aliases']:
+                    self.by_alias[a] = o
+        self.leftover = self._load(app.extra_args.get())
+        self.current = None
+
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill='both', expand=True)
+
+        top = ttk.Frame(outer)
+        top.pack(fill='x')
+        ttk.Label(top, text='Search').pack(side='left')
+        self.query = tk.StringVar()
+        self.query.trace_add('write', lambda *_: self._fill())
+        ent = ttk.Entry(top, textvariable=self.query)
+        ent.pack(side='left', fill='x', expand=True, padx=8)
+        self.only_on = tk.BooleanVar()
+        ttk.Checkbutton(top, text='Show selected only', variable=self.only_on,
+                        command=self._fill).pack(side='left')
+
+        mid = ttk.Frame(outer)
+        mid.pack(fill='both', expand=True, pady=8)
+        self.tree = ttk.Treeview(mid, columns=('value', 'desc'), selectmode='browse')
+        self.tree.heading('#0', text='Option')
+        self.tree.heading('value', text='Value')
+        self.tree.heading('desc', text='Description')
+        self.tree.column('#0', width=260, stretch=False)
+        self.tree.column('value', width=150, stretch=False)
+        self.tree.column('desc', width=420)
+        sb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        self.tree.tag_configure('group', foreground=pal['accent'])
+        self.tree.tag_configure('on', foreground=pal['fg'])
+        self.tree.bind('<<TreeviewSelect>>', self._on_select)
+        self.tree.bind('<Button-1>', self._on_click)
+        self.tree.bind('<space>', lambda e: (self._toggle(self.current), 'break')[1])
+
+        det = ttk.LabelFrame(outer, text='Details', padding=8)
+        det.pack(fill='x')
+        det.columnconfigure(1, weight=1)
+        self.d_name = ttk.Label(det, text='Click an option to see what it does.', style='Head.TLabel')
+        self.d_name.grid(row=0, column=0, columnspan=3, sticky='w')
+        self.d_help = ttk.Label(det, text='', wraplength=840, justify='left')
+        self.d_help.grid(row=1, column=0, columnspan=3, sticky='w', pady=(4, 6))
+        self.d_vlabel = ttk.Label(det, text='Value')
+        self.d_vlabel.grid(row=2, column=0, sticky='w')
+        self.value = tk.StringVar()
+        self.value.trace_add('write', self._on_value)
+        self.d_value = ttk.Entry(det, textvariable=self.value, state='disabled')
+        self.d_value.grid(row=2, column=1, sticky='ew', padx=8)
+        self.d_hint = ttk.Label(det, text='', foreground=pal['muted'])
+        self.d_hint.grid(row=2, column=2, sticky='w')
+
+        bot = ttk.Frame(outer)
+        bot.pack(fill='x', pady=(8, 0))
+        self.count = tk.StringVar()
+        ttk.Label(bot, textvariable=self.count).pack(side='left')
+        ttk.Button(bot, text='Apply', style='Accent.TButton', command=self._apply).pack(side='right')
+        ttk.Button(bot, text='Cancel', command=self.destroy).pack(side='right', padx=6)
+        ttk.Button(bot, text='Clear all', command=self._clear).pack(side='right')
+
+        self._fill()
+        app._set_titlebar(self)
+        ent.focus_set()
+        self.grab_set()
+
+    # parse the current "Extra arguments" so already-used options start ticked
+    def _load(self, text):
+        try:
+            toks = split_args(text)
+        except ValueError:
+            return text.strip()
+        left, i = [], 0
+        while i < len(toks):
+            t = toks[i]
+            key, val = (t.split('=', 1) + [None])[:2] if t.startswith('--') else (t, None)
+            o = self.by_alias.get(key)
+            if o is None:
+                left.append(t)
+                i += 1
+                continue
+            st = self.state[o['name']]
+            st['on'] = True
+            if o['takes_value']:
+                if val is not None:
+                    st['value'] = val
+                else:
+                    vals = toks[i + 1:i + 1 + o['nargs']]
+                    if o['nargs'] == 1:
+                        st['value'] = vals[0] if vals else ''
+                    else:
+                        st['value'] = ' '.join(quote_arg(v) for v in vals)
+                    i += len(vals)
+            i += 1
+        return ' '.join(quote_arg(t) for t in left)
+
+    def _label(self, o):
+        return ('☑  ' if self.state[o['name']]['on'] else '☐  ') + o['name']
+
+    def _fill(self):
+        q = self.query.get().strip().lower()
+        only = self.only_on.get()
+        self.tree.delete(*self.tree.get_children())
+        self.iid_to_opt = {}
+        for title, opts in self.groups:
+            shown = [o for o in opts
+                     if (not only or self.state[o['name']]['on'])
+                     and (not q or q in o['name'].lower() or q in o['help'].lower()
+                          or any(q in a.lower() for a in o['aliases']))]
+            if not shown:
+                continue
+            gid = self.tree.insert('', 'end', text=title, open=True, tags=('group',))
+            for o in shown:
+                st = self.state[o['name']]
+                desc = o['help'].split('. ')[0]
+                iid = self.tree.insert(gid, 'end', text=self._label(o),
+                                       values=(st['value'], desc), tags=('on',) if st['on'] else ())
+                self.iid_to_opt[iid] = o
+        self._update_count()
+
+    def _update_count(self):
+        n = sum(1 for s in self.state.values() if s['on'])
+        self.count.set(f'{n} option(s) selected')
+
+    def _refresh_row(self, iid):
+        o = self.iid_to_opt[iid]
+        st = self.state[o['name']]
+        self.tree.item(iid, text=self._label(o), tags=('on',) if st['on'] else ())
+        self.tree.set(iid, 'value', st['value'])
+        self._update_count()
+
+    def _on_click(self, e):
+        iid = self.tree.identify_row(e.y)
+        if iid in self.iid_to_opt and self.tree.identify_column(e.x) == '#0':
+            el = self.tree.identify_element(e.x, e.y)
+            if 'indicator' not in el:
+                self.tree.selection_set(iid)
+                self._toggle(iid)
+                return 'break'
+
+    def _toggle(self, iid):
+        if iid not in self.iid_to_opt:
+            return
+        o = self.iid_to_opt[iid]
+        st = self.state[o['name']]
+        st['on'] = not st['on']
+        self._refresh_row(iid)
+        if st['on'] and o['takes_value'] and not st['value']:
+            self.d_value.focus_set()
+
+    def _on_select(self, _e=None):
+        sel = self.tree.selection()
+        iid = sel[0] if sel else None
+        self.current = iid
+        o = self.iid_to_opt.get(iid)
+        if not o:
+            return
+        self.d_name.configure(text='  '.join(o['aliases']) +
+                              (f'  {o["metavar"]}' if o['takes_value'] else ''))
+        self.d_help.configure(text=o['help'] or '(no description)')
+        self._loading = True
+        self.value.set(self.state[o['name']]['value'])
+        self._loading = False
+        if o['takes_value']:
+            self.d_value.configure(state='normal')
+            hint = f'{o["nargs"]} values, separated by spaces' if o['nargs'] > 1 else o['metavar']
+            self.d_hint.configure(text=hint)
+        else:
+            self.d_value.configure(state='disabled')
+            self.d_hint.configure(text='on/off option — no value needed')
+
+    def _on_value(self, *_):
+        if getattr(self, '_loading', False):
+            return
+        o = self.iid_to_opt.get(self.current)
+        if not o or not o['takes_value']:
+            return
+        st = self.state[o['name']]
+        st['value'] = self.value.get()
+        if st['value'].strip():
+            st['on'] = True
+        self._refresh_row(self.current)
+
+    def _clear(self):
+        for st in self.state.values():
+            st['on'] = False
+            st['value'] = ''
+        self.leftover = ''
+        self._fill()
+
+    def _apply(self):
+        parts, missing = [], []
+        for _title, opts in self.groups:
+            for o in opts:
+                st = self.state[o['name']]
+                if not st['on']:
+                    continue
+                if not o['takes_value']:
+                    parts.append(o['name'])
+                    continue
+                try:
+                    vals = split_args(st['value'])
+                except ValueError:
+                    vals = [st['value']]
+                if len(vals) < o['nargs'] or not st['value'].strip():
+                    missing.append(o['name'])
+                    continue
+                if o['nargs'] == 1:
+                    vals = [st['value'].strip()]
+                parts.append(o['name'] + ' ' + ' '.join(quote_arg(v) for v in vals[:o['nargs']]))
+        if missing:
+            messagebox.showwarning('Missing values', 'These options need a value:\n\n' + '\n'.join(missing),
+                                   parent=self)
+            return
+        if self.leftover:
+            parts.append(self.leftover)
+        self.app.extra_args.set(' '.join(parts))
+        self.destroy()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -270,9 +587,11 @@ class App(tk.Tk):
         self.rows = {}
         self.settings = dict(DEFAULTS)
         self._load_settings()
+        self.palette = PALETTES['dark' if self.settings.get('dark', True) else 'light']
         self._style()
         self._build()
         self._apply_settings()
+        self._apply_theme()
         self._on_mode()
         self.after(100, self._poll)
         self.protocol('WM_DELETE_WINDOW', self._on_close)
@@ -287,13 +606,116 @@ class App(tk.Tk):
     # ---------- look ----------
     def _style(self):
         st = ttk.Style(self)
-        for theme in ('vista', 'clam'):
-            if theme in st.theme_names():
-                st.theme_use(theme)
-                break
+        st.theme_use('clam')  # the only built-in theme that can be fully recoloured
         st.configure('Accent.TButton', font=('Segoe UI', 10, 'bold'), padding=(14, 6))
         st.configure('Treeview', rowheight=24)
         st.configure('Head.TLabel', font=('Segoe UI', 10, 'bold'))
+
+    def _apply_theme(self):
+        p = self.palette = PALETTES['dark' if self.dark.get() else 'light']
+        st = ttk.Style(self)
+        st.configure('.', background=p['bg'], foreground=p['fg'], fieldbackground=p['field'],
+                     bordercolor=p['border'], darkcolor=p['bg'], lightcolor=p['bg'],
+                     troughcolor=p['field'], selectbackground=p['accent'],
+                     selectforeground=p['on_accent'], insertcolor=p['fg'], focuscolor=p['accent'],
+                     arrowcolor=p['muted'], font=('Segoe UI', 9))
+        st.map('.', foreground=[('disabled', p['disabled'])])
+        st.configure('TFrame', background=p['bg'])
+        st.configure('TLabel', background=p['bg'], foreground=p['fg'])
+        st.configure('Head.TLabel', background=p['bg'], foreground=p['fg'])
+        st.configure('TLabelframe', background=p['bg'], bordercolor=p['border'])
+        st.configure('TLabelframe.Label', background=p['bg'], foreground=p['muted'])
+        st.configure('TButton', background=p['surface'], foreground=p['fg'], bordercolor=p['border'],
+                     lightcolor=p['surface'], darkcolor=p['surface'], padding=(10, 4))
+        st.map('TButton', background=[('disabled', p['bg']), ('pressed', p['hover']), ('active', p['hover'])],
+               lightcolor=[('active', p['hover'])], darkcolor=[('active', p['hover'])])
+        st.configure('Accent.TButton', background=p['accent'], foreground=p['on_accent'],
+                     bordercolor=p['accent'], lightcolor=p['accent'], darkcolor=p['accent'])
+        st.map('Accent.TButton',
+               background=[('disabled', p['surface']), ('pressed', p['accent_hover']), ('active', p['accent_hover'])],
+               foreground=[('disabled', p['disabled'])],
+               lightcolor=[('active', p['accent_hover'])], darkcolor=[('active', p['accent_hover'])])
+        for w in ('TEntry', 'TCombobox'):
+            st.configure(w, fieldbackground=p['field'], foreground=p['fg'], bordercolor=p['border'],
+                         lightcolor=p['field'], darkcolor=p['field'], background=p['surface'])
+            st.map(w, fieldbackground=[('disabled', p['bg']), ('readonly', p['field'])],
+                   foreground=[('disabled', p['disabled'])],
+                   bordercolor=[('focus', p['accent'])], lightcolor=[('focus', p['accent'])],
+                   selectbackground=[('readonly', p['field'])], selectforeground=[('readonly', p['fg'])],
+                   background=[('active', p['hover'])])
+        for w in ('TCheckbutton', 'TRadiobutton'):
+            st.configure(w, background=p['bg'], foreground=p['fg'], indicatorbackground=p['field'],
+                         indicatorforeground=p['accent'], upperbordercolor=p['border'],
+                         lowerbordercolor=p['border'])
+            st.map(w, background=[('active', p['bg'])],
+                   indicatorbackground=[('disabled', p['bg']), ('pressed', p['hover']), ('selected', p['field'])])
+        st.configure('Treeview', background=p['field'], fieldbackground=p['field'], foreground=p['fg'],
+                     bordercolor=p['border'], lightcolor=p['field'], darkcolor=p['field'])
+        st.map('Treeview', background=[('selected', p['select'])], foreground=[('selected', p['fg'])])
+        st.configure('Treeview.Heading', background=p['surface'], foreground=p['muted'],
+                     bordercolor=p['border'], lightcolor=p['surface'], darkcolor=p['surface'],
+                     font=('Segoe UI', 9, 'bold'))
+        st.map('Treeview.Heading', background=[('active', p['hover'])])
+        st.configure('TProgressbar', background=p['accent'], troughcolor=p['field'],
+                     bordercolor=p['border'], lightcolor=p['accent'], darkcolor=p['accent'])
+        st.configure('TScrollbar', background=p['surface'], troughcolor=p['bg'], bordercolor=p['bg'],
+                     arrowcolor=p['muted'], lightcolor=p['surface'], darkcolor=p['surface'])
+        st.map('TScrollbar', background=[('active', p['hover'])])
+        st.configure('TPanedwindow', background=p['bg'])
+        st.configure('Sash', sashthickness=6, gripcount=0, background=p['bg'])
+
+        self.configure(bg=p['bg'])
+        # Combobox drop-down lists are plain Tk listboxes
+        for opt, val in (('background', p['field']), ('foreground', p['fg']),
+                         ('selectBackground', p['accent']), ('selectForeground', p['on_accent'])):
+            self.option_add(f'*TCombobox*Listbox.{opt}', val)
+        for cb in self._all_widgets(self, ttk.Combobox):
+            try:
+                lb = self.tk.call('ttk::combobox::PopdownWindow', cb) + '.f.l'
+                self.tk.call(lb, 'configure', '-background', p['field'], '-foreground', p['fg'],
+                             '-selectbackground', p['accent'], '-selectforeground', p['on_accent'])
+            except tk.TclError:
+                pass
+        for t in (self.url_text, self.log):
+            t.configure(background=p['field'], foreground=p['fg'], insertbackground=p['fg'],
+                        selectbackground=p['select'], selectforeground=p['fg'],
+                        highlightthickness=1, highlightbackground=p['border'],
+                        highlightcolor=p['accent'], relief='flat', borderwidth=4)
+        self.log.tag_configure('warn', foreground=p['warn'])
+        self.log.tag_configure('err', foreground=p['err'])
+        self.tree.tag_configure('done', foreground=p['ok'])
+        self.tree.tag_configure('err', foreground=p['err'])
+        self._set_titlebar(self)
+
+    def _all_widgets(self, root, cls):
+        out = []
+        for w in root.winfo_children():
+            if isinstance(w, cls):
+                out.append(w)
+            out += self._all_widgets(w, cls)
+        return out
+
+    def _set_titlebar(self, win):
+        """Dark window title bar on Windows 10/11."""
+        if not sys.platform.startswith('win'):
+            return
+        try:
+            import ctypes
+            win.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+            val = ctypes.c_int(1 if self.dark.get() else 0)
+            for attr in (20, 19):
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), 4) == 0:
+                    break
+            # nudge Windows to repaint the title bar
+            win.withdraw()
+            win.deiconify()
+        except Exception:
+            pass
+
+    def _toggle_theme(self):
+        self._apply_theme()
+        self._save_settings()
 
     # ---------- layout ----------
     def _build(self):
@@ -403,7 +825,8 @@ class App(tk.Tk):
         ]).grid(row=1, column=1, sticky='ew', padx=6, pady=4)
         ttk.Label(out, text='Extra arguments').grid(row=2, column=0, sticky='w')
         ttk.Entry(out, textvariable=self.extra_args).grid(row=2, column=1, sticky='ew', padx=6)
-        ttk.Button(out, text='Show command', command=self._show_cmd).grid(row=2, column=2, columnspan=2, sticky='ew')
+        ttk.Button(out, text='Pick…', command=self._pick_args).grid(row=2, column=2, sticky='ew')
+        ttk.Button(out, text='Show command', command=self._show_cmd).grid(row=2, column=3, sticky='ew', padx=(4, 0))
 
         # -- Buttons
         bar = ttk.Frame(root)
@@ -413,8 +836,10 @@ class App(tk.Tk):
         self.btn_cancel = ttk.Button(bar, text='Cancel', command=self._cancel, state='disabled')
         self.btn_cancel.pack(side='left', padx=6)
         ttk.Button(bar, text='Clear list', command=self._clear_list).pack(side='left')
+        self.dark = tk.BooleanVar()
+        ttk.Checkbutton(bar, text='Dark mode', variable=self.dark, command=self._toggle_theme).pack(side='right')
         self.status = tk.StringVar(value='Ready')
-        ttk.Label(bar, textvariable=self.status).pack(side='right')
+        ttk.Label(bar, textvariable=self.status).pack(side='right', padx=(0, 16))
 
         # -- Queue + log
         pane = ttk.PanedWindow(root, orient='vertical')
@@ -516,16 +941,25 @@ class App(tk.Tk):
         lines = self.url_text.get('1.0', 'end').splitlines()
         return [u.strip() for u in lines if u.strip() and not u.strip().startswith('#')]
 
+    def _pick_args(self):
+        try:
+            ArgPicker(self)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f'Could not load the yt-dlp option list:\n{e}')
+
     def _show_cmd(self):
         try:
             args = build_args(self._collect())
         except ValueError as e:
             messagebox.showerror(APP_NAME, f'Extra arguments could not be parsed:\n{e}')
             return
-        cmd = 'yt-dlp ' + ' '.join(shlex.quote(a) for a in args) + ' ' + ' '.join(self._urls() or ['<URL>'])
-        win = tk.Toplevel(self)
+        cmd = 'yt-dlp ' + ' '.join(quote_arg(a) for a in args) + ' ' + ' '.join(self._urls() or ['<URL>'])
+        p = self.palette
+        win = tk.Toplevel(self, bg=p['bg'])
         win.title('Equivalent command')
-        t = tk.Text(win, wrap='word', height=8, width=100, font=('Consolas', 9))
+        t = tk.Text(win, wrap='word', height=8, width=100, font=('Consolas', 9), background=p['field'],
+                    foreground=p['fg'], insertbackground=p['fg'], relief='flat', borderwidth=6,
+                    selectbackground=p['select'], selectforeground=p['fg'])
         t.insert('1.0', cmd)
         t.pack(fill='both', expand=True, padx=8, pady=8)
         ttk.Button(win, text='Copy', command=lambda: (self.clipboard_clear(), self.clipboard_append(cmd))).pack(pady=(0, 8))
