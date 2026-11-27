@@ -208,6 +208,63 @@ def make_ydl(opts):
     return ydl
 
 
+_URL_RE = re.compile(r'https?://[^\s<>"\'{}|\\^`\[\]]+', re.I)
+_SKIP_IES = {'Generic', 'KnownDRM', 'KnownPiracy', 'KnownLiability'}
+_IE_CLASSES = None
+
+
+def find_urls(text):
+    """All http(s) links in a piece of text, in order, without duplicates."""
+    out = []
+    for m in _URL_RE.finditer(text or ''):
+        u = m.group(0).rstrip('.,;:!?)\'"')
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def is_supported_url(url):
+    """True if a specific site handler (not the catch-all) recognises the link."""
+    global _IE_CLASSES
+    if _IE_CLASSES is None:
+        from yt_dlp.extractor import gen_extractor_classes
+        _IE_CLASSES = list(EXTRA_EXTRACTORS) + [c for c in gen_extractor_classes() if c.ie_key() not in _SKIP_IES]
+    for c in _IE_CLASSES:
+        try:
+            if c.suitable(url):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def urls_from_drop(paths_or_text, splitlist=None):
+    """Links from something dropped on the window: text, browser links, .url shortcuts or .txt lists."""
+    items = []
+    if splitlist:
+        try:
+            items = list(splitlist(paths_or_text))
+        except Exception:
+            items = []
+    if items and all(os.path.isfile(i) for i in items):
+        urls = []
+        for path in items:
+            ext = os.path.splitext(path)[1].lower()
+            try:
+                with open(path, encoding='utf-8', errors='replace') as f:
+                    text = f.read(2_000_000)
+            except OSError:
+                continue
+            if ext in ('.url', '.website'):  # Windows internet shortcut
+                m = re.search(r'^URL=(\S+)', text, re.M)
+                text = m.group(1) if m else ''
+            elif ext not in ('.txt', '.text', '.list', '.csv', '.md', '.html', '.htm', ''):
+                continue
+            urls += [u for u in find_urls(text) if u not in urls]
+        return urls
+    return find_urls(paths_or_text)
+
+
 APP_NAME = 'yt-dlp GUI'
 UPDATE_REPO = 'hawnji/ytdlp-gui'
 UPDATE_ASSET = 'yt-dlp-GUI-windows.zip'
@@ -332,6 +389,7 @@ DEFAULTS = {
     'skip_existing': True,
     'parallel': 3,
     'only_new': False,
+    'watch_clipboard': False,
     'dark': True,
 }
 
@@ -443,10 +501,43 @@ def open_path(path):
         messagebox.showerror(APP_NAME, f'Could not open:\n{path}\n\n{e}')
 
 
+class SettingsError(ValueError):
+    """A setting the user needs to fix (shown as-is)."""
+
+
+def clip_range(s):
+    """(start, end) in seconds from the clip boxes, or None for the whole thing. end may be None."""
+    from yt_dlp.utils import parse_duration
+    a, b = (s.get('clip_start') or '').strip(), (s.get('clip_end') or '').strip()
+    if not a and not b:
+        return None
+    start = parse_duration(a) if a else 0
+    end = parse_duration(b) if b else None
+    if start is None:
+        raise SettingsError(f'Clip start "{a}" is not a time. Use something like 1:30, 90 or 1:02:03.')
+    if b and end is None:
+        raise SettingsError(f'Clip end "{b}" is not a time. Use something like 2:45, 165 or 1:05:00.')
+    if end is not None and end <= start:
+        raise SettingsError('The clip end time must be after the start time.')
+    return start, end
+
+
 def build_args(s):
     """Turn GUI settings into yt-dlp command-line arguments."""
     args = ['--newline', '--no-colors']
-    args += ['-P', s['outdir'], '-o', s['template'] or DEFAULTS['template']]
+    template = s['template'] or DEFAULTS['template']
+    clip = clip_range(s)
+    if clip:
+        start, end = clip
+        # keep clips from overwriting (or being skipped because of) the full download
+        suffix = (' [clip %(section_start)d-%(section_end)ds]' if end is not None
+                  else ' [from %(section_start)ds]')
+        template = (template[:-len('.%(ext)s')] + suffix + '.%(ext)s'
+                    if template.endswith('.%(ext)s') else template + suffix)
+        args += ['--download-sections', f'*{start:g}-{end:g}' if end is not None else f'*{start:g}-inf']
+        if s.get('clip_precise'):
+            args += ['--force-keyframes-at-cuts']
+    args += ['-P', s['outdir'], '-o', template]
 
     if s['mode'] == 'audio':
         args += ['-f', 'bestaudio/best', '-x']
@@ -984,6 +1075,9 @@ class App(tk.Tk):
         self._on_mode()
         self.after(100, self._poll)
         self.after(2000, lambda: self._check_updates(quiet=True))
+        self._clip_last = self._read_clipboard()
+        self.after(700, self._poll_clipboard)
+        self._enable_drag_and_drop()
         self.protocol('WM_DELETE_WINDOW', self._on_close)
         if not shutil.which('ffmpeg'):
             self._log('WARNING: FFmpeg was not found on PATH. Merging best video+audio, '
@@ -1013,6 +1107,9 @@ class App(tk.Tk):
         st.configure('TFrame', background=p['bg'])
         st.configure('TLabel', background=p['bg'], foreground=p['fg'])
         st.configure('Head.TLabel', background=p['bg'], foreground=p['fg'])
+        st.configure('Active.TLabel', background=p['bg'], foreground=p['accent'])
+        st.configure('Bad.TLabel', background=p['bg'], foreground=p['err'])
+        st.configure('Hint.TLabel', background=p['bg'], foreground=p['muted'])
         st.configure('TLabelframe', background=p['bg'], bordercolor=p['border'])
         st.configure('TLabelframe.Label', background=p['bg'], foreground=p['muted'])
         st.configure('TButton', background=p['surface'], foreground=p['fg'], bordercolor=p['border'],
@@ -1125,6 +1222,10 @@ class App(tk.Tk):
         ttk.Button(top, text='Clear', command=lambda: self.url_text.delete('1.0', 'end')).grid(
             row=1, column=1, sticky='ew', padx=(8, 0), pady=4)
         ttk.Button(top, text='From file…', command=self._load_urls).grid(row=2, column=1, sticky='ew', padx=(8, 0))
+        self.watch_clipboard = tk.BooleanVar()
+        ttk.Checkbutton(top, text='Watch clipboard — links you copy are added automatically',
+                        variable=self.watch_clipboard, command=self._on_watch_toggle).grid(
+            row=3, column=0, columnspan=2, sticky='w', pady=(6, 0))
 
         # Options
         opt = ttk.Frame(root)
@@ -1229,6 +1330,25 @@ class App(tk.Tk):
         ttk.Entry(out, textvariable=self.extra_args).grid(row=2, column=1, sticky='ew', padx=6)
         ttk.Button(out, text='Pick…', command=self._pick_args).grid(row=2, column=2, sticky='ew')
         ttk.Button(out, text='Show command', command=self._show_cmd).grid(row=2, column=3, sticky='ew', padx=(4, 0))
+        self.clip_start = tk.StringVar()
+        self.clip_end = tk.StringVar()
+        self.clip_precise = tk.BooleanVar()
+        self.lbl_clip = ttk.Label(out, text='Clip section')
+        self.lbl_clip.grid(row=3, column=0, sticky='w', pady=(4, 0))
+        cf = ttk.Frame(out)
+        cf.grid(row=3, column=1, columnspan=3, sticky='w', padx=6, pady=(4, 0))
+        ttk.Label(cf, text='Start').pack(side='left')
+        ttk.Entry(cf, textvariable=self.clip_start, width=9).pack(side='left', padx=(4, 10))
+        ttk.Label(cf, text='End').pack(side='left')
+        ttk.Entry(cf, textvariable=self.clip_end, width=9).pack(side='left', padx=(4, 6))
+        ttk.Button(cf, text='✕', width=3, command=lambda: (self.clip_start.set(''), self.clip_end.set(''))).pack(
+            side='left')
+        ttk.Checkbutton(cf, text='Precise cut (slower)', variable=self.clip_precise).pack(side='left', padx=(10, 0))
+        self.lbl_clip_hint = ttk.Label(cf, text='e.g. 1:30 to 2:45 — leave blank for the whole thing',
+                                       style='Hint.TLabel')
+        self.lbl_clip_hint.pack(side='left', padx=(10, 0))
+        for v in (self.clip_start, self.clip_end):
+            v.trace_add('write', lambda *_: self._on_clip_change())
 
         # -- Buttons
         bar = ttk.Frame(root)
@@ -1302,7 +1422,26 @@ class App(tk.Tk):
             var.set(self.settings[k])
 
     def _collect(self):
-        return {k: var.get() for k, var in self._vars().items()}
+        s = {k: var.get() for k, var in self._vars().items()}
+        # clip times apply to this run only, so they are not saved with the settings
+        s.update(clip_start=self.clip_start.get(), clip_end=self.clip_end.get(),
+                 clip_precise=self.clip_precise.get())
+        return s
+
+    def _on_clip_change(self):
+        try:
+            clip = clip_range(self._collect())
+        except SettingsError:
+            self.lbl_clip.configure(style='Bad.TLabel')
+            self.lbl_clip_hint.configure(text='not a valid time yet', style='Bad.TLabel')
+            return
+        self.lbl_clip.configure(style='Active.TLabel' if clip else 'TLabel')
+        if clip:
+            start, end = clip
+            text = f'clipping {human_eta(start)} → {human_eta(end) if end is not None else "end"}'
+            self.lbl_clip_hint.configure(text=text, style='Active.TLabel')
+        else:
+            self.lbl_clip_hint.configure(text='e.g. 1:30 to 2:45 — leave blank for the whole thing', style='Hint.TLabel')
 
     def _save_settings(self):
         try:
@@ -1360,7 +1499,8 @@ class App(tk.Tk):
         try:
             args = build_args(self._collect())
         except ValueError as e:
-            messagebox.showerror(APP_NAME, f'Extra arguments could not be parsed:\n{e}')
+            messagebox.showerror(APP_NAME, str(e) if isinstance(e, SettingsError)
+                                 else f'Extra arguments could not be parsed:\n{e}')
             return
         cmd = 'yt-dlp ' + ' '.join(quote_arg(a) for a in args) + ' ' + ' '.join(self._urls() or ['<URL>'])
         p = self.palette
@@ -1390,7 +1530,8 @@ class App(tk.Tk):
         try:
             args = build_args(s)
         except ValueError as e:
-            messagebox.showerror(APP_NAME, f'Extra arguments could not be parsed:\n{e}')
+            messagebox.showerror(APP_NAME, str(e) if isinstance(e, SettingsError)
+                                 else f'Extra arguments could not be parsed:\n{e}')
             return
         os.makedirs(s['outdir'], exist_ok=True)
         self._save_settings()
@@ -1478,6 +1619,7 @@ class App(tk.Tk):
             open_path(os.path.dirname(path))
 
     def _copy(self, text):
+        self._clip_last = text  # don't let the clipboard watcher re-add links copied from the list
         self.clipboard_clear()
         self.clipboard_append(text)
 
@@ -1530,6 +1672,75 @@ class App(tk.Tk):
                 return
             self.worker.cancel.set()
         self.destroy()
+
+    # ---------- adding links: clipboard watching and drag-and-drop ----------
+    def _add_urls(self, urls, source):
+        have = set(self._urls())
+        new = [u for u in urls if u not in have]
+        if not new:
+            return 0
+        cur = self.url_text.get('1.0', 'end').strip()
+        self.url_text.insert('end', ('\n' if cur else '') + '\n'.join(new))
+        self.url_text.see('end')
+        what = f'{len(new)} link' + ('s' if len(new) != 1 else '')
+        self.status.set(f'Added {what} from {source}')
+        self._log(f'Added {what} from {source}: ' + ', '.join(new[:3]) + (' …' if len(new) > 3 else ''))
+        return len(new)
+
+    def _read_clipboard(self):
+        try:
+            return self.clipboard_get()
+        except tk.TclError:
+            return None
+
+    def _on_watch_toggle(self):
+        # don't grab whatever was already on the clipboard when the box is ticked
+        self._clip_last = self._read_clipboard()
+        if self.watch_clipboard.get():
+            self.status.set('Watching the clipboard — copy a link and it will appear here')
+
+    def _poll_clipboard(self):
+        try:
+            if self.watch_clipboard.get():
+                text = self._read_clipboard()
+                if text is not None and text != self._clip_last:
+                    self._clip_last = text
+                    if len(text) < 200_000:
+                        urls = [u for u in find_urls(text) if is_supported_url(u)]
+                        if urls:
+                            self._add_urls(urls, 'the clipboard')
+        finally:
+            self.after(700, self._poll_clipboard)
+
+    def _enable_drag_and_drop(self):
+        """Accept links, .url shortcuts and .txt lists dropped on the window (needs tkdnd)."""
+        try:
+            from tkinterdnd2 import TkinterDnD
+            TkinterDnD._require(self)
+        except Exception:
+            return False
+        cmd = self.register(self._on_drop)
+        ok = False
+        for w in (self.url_text, self.tree, self.log):
+            try:
+                self.tk.call('tkdnd::drop_target', 'register', w._w, ('DND_Text', 'DND_Files'))
+                self.tk.call('bind', w._w, '<<Drop>>', cmd + ' %D')
+                ok = True
+            except tk.TclError:
+                pass
+        if ok:
+            self._first_section.configure(
+                text='URLs (one per line — videos, playlists or channels; you can also drag links here)')
+        return ok
+
+    def _on_drop(self, data):
+        urls = urls_from_drop(data, self.tk.splitlist)
+        if urls:
+            if not self._add_urls(urls, 'drag and drop'):
+                self.status.set('Those links are already in the list')
+        else:
+            self.status.set('No links found in what was dropped')
+        return 'copy'
 
     # ---------- updates ----------
     def _check_updates(self, quiet=True):
