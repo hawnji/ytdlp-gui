@@ -159,7 +159,42 @@ class SunoPlaylistIE(InfoExtractor):
             webpage_url=f'https://suno.com/playlist/{playlist_id}')
 
 
-EXTRA_EXTRACTORS = (SunoIE, SunoPlaylistIE)
+class SunoProfileIE(InfoExtractor):
+    """Suno profiles: suno.com/@handle — every published song, newest first."""
+    IE_NAME = 'suno:profile'
+    _VALID_URL = r'https?://(?:www\.|app\.)?suno\.com/@(?P<id>[\w.-]+)'
+    _API = 'https://studio-api.prod.suno.com/api/profiles/'
+
+    def _real_extract(self, url):
+        handle = self._match_id(url)
+        info, entries, seen = {}, [], set()
+        for page in range(1, 201):
+            data = self._download_json(
+                f'{self._API}{handle}', handle, f'Downloading song list page {page}',
+                query={'page': page, 'playlists_sort_by': 'created_at', 'clips_sort_by': 'created_at'})
+            if page == 1:
+                info = data
+            new = [c for c in data.get('clips') or [] if c.get('id') and c['id'] not in seen]
+            for c in new:
+                seen.add(c['id'])
+                entries.append(self.url_result(
+                    f'https://suno.com/song/{c["id"]}', SunoIE, c['id'], c.get('title'),
+                    duration=float_or_none((c.get('metadata') or {}).get('duration')),
+                    uploader=c.get('display_name')))
+            total = data.get('num_total_clips')
+            if not new or (total and len(entries) >= total):
+                break
+        if not entries:
+            raise ExtractorError('No public songs found on this Suno profile', expected=True)
+        name = info.get('display_name') or handle
+        return self.playlist_result(
+            entries, info.get('handle') or handle, name, info.get('profile_description') or None,
+            thumbnail=url_or_none(info.get('avatar_image_url')),
+            uploader=name, uploader_id=info.get('handle') or handle,
+            uploader_url=f'https://suno.com/@{handle}', webpage_url=f'https://suno.com/@{handle}')
+
+
+EXTRA_EXTRACTORS = (SunoIE, SunoPlaylistIE, SunoProfileIE)
 
 
 def make_ydl(opts):
