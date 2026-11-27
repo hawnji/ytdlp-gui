@@ -1,0 +1,61 @@
+{
+  "_comment": "Hand-written patch notes for releases made before automatic patch notes existed.",
+  "1": [
+    "First version of yt-dlp GUI: paste links and download video or audio-only (MP3, M4A, Opus, FLAC, WAV)",
+    "Quality, format and file-name options, subtitles, embedded thumbnails, metadata and chapters, SponsorBlock, cookies from your browser, speed limit",
+    "Download list with progress, speed and time left; log window; settings are remembered",
+    "Built as a Windows .exe with FFmpeg and Deno included"
+  ],
+  "2": [
+    "Behind-the-scenes clean-up of the GitHub repository (no change to the app)"
+  ],
+  "3": [
+    "Fixed Kick (and other Cloudflare-protected sites) failing with HTTP Error 403: Forbidden"
+  ],
+  "4": [
+    "Dark mode in Claude's colours, on by default (switch at the bottom right)",
+    "Pick… button next to Extra arguments: a searchable list of every yt-dlp option with checkboxes"
+  ],
+  "5": [
+    "Simultaneous downloads: playlists (and multiple links) download several items at once — 3 by default, up to 10",
+    "Fixed the app freezing if yt-dlp couldn't start (for example when reading browser cookies failed)"
+  ],
+  "6": [
+    "Suno support: song links (suno.com/song/…) and share links (suno.com/s/…)",
+    "Songs are tagged with title, artist, date and style; Audio only gives MP3 (or your chosen format)"
+  ],
+  "7": [
+    "Suno playlists (suno.com/playlist/…): every song is queued and downloaded, numbered in playlist order"
+  ],
+  "8": [
+    "README edited on GitHub (no change to the app)"
+  ],
+  "9": [
+    "Suno profiles (suno.com/@name): downloads every public song on a profile"
+  ],
+  "10": [
+    "Automatic updates: the app tells you when a new build is out and can update itself; GitHub rebuilds weekly with the newest yt-dlp",
+    "Only download new items: remembers what you've downloaded, so re-pasting a playlist, channel or Suno profile only grabs new things",
+    "Right-click menu on downloads (open file, show in folder, copy or open link, retry, remove) and a Retry failed button that keeps playlist numbering"
+  ],
+  "11": [
+    "Fixed WAV downloads being marked as failed (cover art can't be embedded in WAV, so it's now skipped)"
+  ],
+  "12": [
+    "Fixed the app not reopening after an update (\"Failed to load Python DLL\")"
+  ],
+  "13": [
+    "Clip section: download just part of a video or song with start/end times, with an optional precise cut",
+    "Watch clipboard: links you copy are added automatically (only from sites the app supports)",
+    "Drag and drop links, .url shortcuts or .txt lists onto the window"
+  ],
+  "14": [
+    "Preview & clip window: scrub through a video frame by frame or a song by its waveform, hear 5 seconds from any point, and set the clip start/end visually"
+  ],
+  "15": [
+    "Preview: grabbable seek slider, draggable start/end edges, and frames that keep updating while you drag"
+  ],
+  "16": [
+    "Fixed YouTube previews and clipped YouTube downloads failing with 403 Forbidden"
+  ]
+}

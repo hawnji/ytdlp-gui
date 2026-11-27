@@ -81,28 +81,11 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path App\* -DestinationPath "yt-dlp-GUI-windows.zip"
 
-      - name: Rename old release tags so they sort correctly (build-9 -> build-0009)
+      - name: Add patch notes to older releases that don't have any
         if: steps.check.outputs.skip != 'true'
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          # GitHub lists releases by tag name as text, so build-9 sorted above build-16.
-          # Zero-padded tags sort correctly; the app's updater reads both forms.
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          $tags = gh release list --limit 500 --json tagName --jq '.[].tagName'
-          foreach ($old in $tags) {
-            if ($old -match '^build-(\d{1,3})$') {
-              $new = 'build-{0:D4}' -f [int]$Matches[1]
-              $sha = git rev-list -n 1 $old
-              git tag -f $new $sha
-              git push -f origin "refs/tags/${new}"
-              gh release edit $old --tag $new --title "yt-dlp GUI (build $([int]$Matches[1]))"
-              git push origin ":refs/tags/${old}"
-              Write-Host "Renamed $old -> $new"
-            }
-          }
+        run: python .github/backfill_notes.py
 
       - name: Write patch notes
         if: steps.check.outputs.skip != 'true'
@@ -123,4 +106,4 @@ jobs:
         run: |
           $n = [int]"${{ github.run_number }}"
           $tag = 'build-{0:D4}' -f $n
-          gh release create $tag "yt-dlp-GUI-windows.zip" --title "yt-dlp GUI (build $n)" --notes-file notes.md --latest
+          gh release create $tag "yt-dlp-GUI-windows.zip" --target "${{ github.sha }}" --title "yt-dlp GUI (build $n)" --notes-file notes.md --latest

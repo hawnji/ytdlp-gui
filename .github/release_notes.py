@@ -11,10 +11,61 @@ import subprocess
 import sys
 
 TRAILERS = ('co-authored-by:', 'claude-session:', 'signed-off-by:')
+FOOTER = ('Update with **Update now** inside the app, or download the zip below, unblock it '
+          '(right-click → Properties → Unblock) and unzip it. Keep ffmpeg.exe, ffprobe.exe and deno.exe '
+          'next to yt-dlp GUI.exe.')
 
 
 def git(*args):
     return subprocess.run(['git', *args], capture_output=True, text=True, encoding='utf-8').stdout
+
+
+def is_commit(sha):
+    return bool(sha) and git('cat-file', '-t', sha).strip() == 'commit'
+
+
+def commits_between(prev_sha, sha):
+    """[(subject, [detail, ...]), ...] for commits after prev_sha up to sha (or just sha if no prev)."""
+    rng = [f'{prev_sha}..{sha}'] if prev_sha else ['-1', sha]
+    raw = git('log', '--reverse', '--no-merges', '--format=%x1e%s%x1f%b', *rng)
+    changes = []
+    for entry in raw.split('\x1e'):
+        if not entry.strip():
+            continue
+        subject, _, text = entry.partition('\x1f')
+        details = []
+        for line in text.splitlines():
+            s = line.strip()
+            if s.lower().startswith(TRAILERS):
+                continue
+            if s.startswith(('- ', '* ')):
+                details.append(s[2:].strip())
+            elif s and details and line.startswith('  '):
+                details[-1] += ' ' + s  # wrapped bullet
+        changes.append((subject.strip(), details))
+    return changes
+
+
+def make_notes(prev_sha, prev_yt, ytdlp, sha, build, first=False, lines=None):
+    if lines:  # hand-written notes
+        changes = [(line, []) for line in lines]
+    else:
+        changes = commits_between(prev_sha, sha) if (first or is_commit(prev_sha)) else []
+    out = [f"## What's new in build {build}", '']
+    if first:
+        out[0] = f'## Build {build} — first release'
+    for subject, details in changes:
+        out.append(f'- **{subject}**' if details else f'- {subject}')
+        out += [f'  - {d}' for d in details]
+    if prev_yt and ytdlp and prev_yt != ytdlp:
+        out.append(f'- yt-dlp updated: {prev_yt} → {ytdlp} (fixes for sites that changed recently)')
+    if len(out) == 2:
+        out.append('- Rebuilt with no changes to the app' if prev_sha else '- First release with patch notes')
+    out += ['', FOOTER, '', '---']
+    if ytdlp:
+        out.append(f'yt-dlp: {ytdlp}')
+    out.append(f'commit: {sha}')
+    return '\n'.join(out)
 
 
 def main():
@@ -25,45 +76,8 @@ def main():
             prev = f.read()
     m_sha = re.search(r'^commit:\s*([0-9a-f]{40})', prev, re.M)
     m_yt = re.search(r'^yt-dlp:\s*(\S+)', prev, re.M)
-    prev_sha = m_sha.group(1) if m_sha else None
-    prev_yt = m_yt.group(1) if m_yt else None
-
-    changes = []
-    if prev_sha and git('cat-file', '-t', prev_sha).strip() == 'commit':
-        raw = git('log', '--reverse', '--no-merges', '--format=%x1e%s%x1f%b', f'{prev_sha}..{sha}')
-        for entry in raw.split('\x1e'):
-            if not entry.strip():
-                continue
-            subject, _, text = entry.partition('\x1f')
-            details = []
-            for line in text.splitlines():
-                s = line.strip()
-                if s.lower().startswith(TRAILERS):
-                    continue
-                if s.startswith(('- ', '* ')):
-                    details.append(s[2:].strip())
-                elif s and details and line.startswith('  '):
-                    details[-1] += ' ' + s  # wrapped bullet
-            changes.append((subject.strip(), details))
-
-    out = [f"## What's new in build {build}", '']
-    for subject, details in changes:
-        out.append(f'- **{subject}**' if details else f'- {subject}')
-        out += [f'  - {d}' for d in details]
-    if prev_yt and prev_yt != ytdlp:
-        out.append(f'- yt-dlp updated: {prev_yt} → {ytdlp} (fixes for sites that changed recently)')
-    if len(out) == 2:
-        out.append('- Rebuilt with no changes to the app' if prev_sha else '- First release with patch notes')
-    out += ['',
-            'Update with **Update now** inside the app, or download the zip below, unblock it '
-            '(right-click → Properties → Unblock) and unzip it. Keep ffmpeg.exe, ffprobe.exe and deno.exe '
-            'next to yt-dlp GUI.exe.',
-            '',
-            '---',
-            f'yt-dlp: {ytdlp}',
-            f'commit: {sha}']
     sys.stdout.reconfigure(encoding='utf-8')
-    print('\n'.join(out))
+    print(make_notes(m_sha.group(1) if m_sha else None, m_yt.group(1) if m_yt else None, ytdlp, sha, build))
 
 
 if __name__ == '__main__':
