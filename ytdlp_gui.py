@@ -392,6 +392,7 @@ DEFAULTS = {
     'only_new': False,
     'watch_clipboard': False,
     'preview_volume': 50.0,
+    'clip_precise': True,
     'dark': True,
 }
 
@@ -532,8 +533,8 @@ def build_args(s):
     if clip:
         start, end = clip
         # keep clips from overwriting (or being skipped because of) the full download
-        suffix = (' [clip %(section_start)d-%(section_end)ds]' if end is not None
-                  else ' [from %(section_start)ds]')
+        suffix = (' [clip %(section_start).1f-%(section_end).1fs]' if end is not None
+                  else ' [from %(section_start).1fs]')
         template = (template[:-len('.%(ext)s')] + suffix + '.%(ext)s'
                     if template.endswith('.%(ext)s') else template + suffix)
         args += ['--download-sections', f'*{start:g}-{end:g}' if end is not None else f'*{start:g}-inf']
@@ -1184,8 +1185,9 @@ class PreviewWindow(tk.Toplevel):
         self.tl.bind('<Motion>', self._tl_hover)
         self.pos = tk.DoubleVar(value=0.0)
         self._syncing = False
-        self.scale = ttk.Scale(outer, from_=0, to=1, orient='horizontal', length=self.TL_W,
+        self.scale = ttk.Scale(outer, from_=0, to=1, orient='horizontal', length=self.TL_W, takefocus=False,
                                variable=self.pos, command=self._on_scale, style='Seek.Horizontal.TScale')
+        self.scale.bind('<ButtonRelease-1>', lambda e: self.focus_set(), add='+')
         self.scale.grid(row=3, column=0, sticky='ew', pady=(6, 0))
 
         ctl = ttk.Frame(outer)
@@ -1205,8 +1207,11 @@ class PreviewWindow(tk.Toplevel):
             self.btn_hear.pack(side='right', padx=(0, 3))
             vol = app.preview_volume
             self.lbl_vol = ttk.Label(ctl, width=5, anchor='e')
-            ttk.Scale(ctl, from_=0, to=100, orient='horizontal', length=110, variable=vol,
-                      command=self._on_volume, style='Seek.Horizontal.TScale').pack(side='right', padx=(0, 10))
+            vs = ttk.Scale(ctl, from_=0, to=100, orient='horizontal', length=110, variable=vol, takefocus=False,
+                           command=self._on_volume, style='Seek.Horizontal.TScale')
+            vs.pack(side='right', padx=(0, 10))
+            # give the keyboard back to the timeline, so arrows/Home/End never move the volume
+            vs.bind('<ButtonRelease-1>', lambda e: self.focus_set(), add='+')
             self.lbl_vol.pack(side='right')
             ttk.Label(ctl, text='Volume').pack(side='right', padx=(10, 4))
             self._vol_job = None
@@ -1221,7 +1226,8 @@ class PreviewWindow(tk.Toplevel):
         ttk.Button(bot, text='Cancel', command=self._close).pack(side='right', padx=6)
         ttk.Button(bot, text='Clear', command=self._clear).pack(side='right')
         self.lbl_hint = ttk.Label(outer, style='Hint.TLabel',
-                                  text='Click or drag on the timeline · ←/→ 1 s · Shift 5 s · Ctrl 0.1 s · [ ] set start/end'
+                                  text='Click or drag on the timeline · ←/→ 1 s · Shift 5 s · Ctrl 0.1 s · '
+                                       'Home/End go to clip start/end · [ ] set start/end'
                                        + (' · Space to hear' if self._winsound else '')
                                        + ' · Make the window bigger for a finer timeline')
         self.lbl_hint.grid(row=6, column=0, sticky='w', pady=(6, 0))
@@ -1232,12 +1238,21 @@ class PreviewWindow(tk.Toplevel):
         self.bind('<Shift-Right>', lambda e: self._nudge(5))
         self.bind('<Control-Left>', lambda e: self._nudge(-0.1))
         self.bind('<Control-Right>', lambda e: self._nudge(0.1))
+        self.bind('<Home>', lambda e: self._seek(self.start or 0, now=True))
+        self.bind('<End>', lambda e: self._seek(self.end if self.end is not None else (self.duration or 0), now=True))
         self.bind('[', lambda e: self._set_start())
         self.bind(']', lambda e: self._set_end())
         self.bind('<space>', lambda e: self._hear())
         self.bind('<Escape>', lambda e: self._close())
         self.protocol('WM_DELETE_WINDOW', self._close)
 
+        # buttons and sliders don't hold the keyboard: keys always drive the timeline
+        for frame in (ctl, bot):
+            for w in frame.winfo_children():
+                try:
+                    w.configure(takefocus=False)
+                except tk.TclError:
+                    pass
         self._update_labels()
         app._set_titlebar(self)
         self.focus_set()
@@ -2172,9 +2187,10 @@ class App(tk.Tk):
         ttk.Entry(cf, textvariable=self.clip_end, width=9).pack(side='left', padx=(4, 6))
         ttk.Button(cf, text='✕', width=3, command=lambda: (self.clip_start.set(''), self.clip_end.set(''))).pack(
             side='left')
-        ttk.Checkbutton(cf, text='Precise cut (slower)', variable=self.clip_precise).pack(side='left', padx=(10, 0))
+        ttk.Checkbutton(cf, text='Precise cut', variable=self.clip_precise).pack(side='left', padx=(10, 0))
         self.lbl_clip_hint = ttk.Label(cf, text='e.g. 1:30 to 2:45 — leave blank for the whole thing',
                                        style='Hint.TLabel')
+        self.clip_precise.trace_add('write', lambda *_: self._on_clip_change())
         self.lbl_clip_hint.pack(side='left', padx=(10, 0))
         for v in (self.clip_start, self.clip_end):
             v.trace_add('write', lambda *_: self._on_clip_change())
@@ -2253,8 +2269,7 @@ class App(tk.Tk):
     def _collect(self):
         s = {k: var.get() for k, var in self._vars().items()}
         # clip times apply to this run only, so they are not saved with the settings
-        s.update(clip_start=self.clip_start.get(), clip_end=self.clip_end.get(),
-                 clip_precise=self.clip_precise.get())
+        s.update(clip_start=self.clip_start.get(), clip_end=self.clip_end.get())
         return s
 
     def _on_clip_change(self):
@@ -2271,6 +2286,9 @@ class App(tk.Tk):
             self.lbl_clip_hint.configure(text=text, style='Active.TLabel')
         else:
             self.lbl_clip_hint.configure(text='e.g. 1:30 to 2:45 — leave blank for the whole thing', style='Hint.TLabel')
+        if clip and not self.clip_precise.get():
+            self.lbl_clip_hint.configure(text=self.lbl_clip_hint.cget('text')
+                                         + '  (fast cut: may start a few seconds early in some players)')
 
     def _save_settings(self):
         try:
