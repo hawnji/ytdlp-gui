@@ -10,6 +10,3 @@ Every push to `main` builds a new release automatically (see `.github/workflows/
 
 ## Run from source
 `pip install "yt-dlp[default]"` then `python ytdlp_gui.py` (Python 3.11+), or build the .exe locally with `build_exe.bat`.
-
-## Extra sites
-The app adds support for **Suno** songs (`suno.com/song/...`, `suno.com/s/...` share links) and playlists (`suno.com/playlist/...`), which yt-dlp itself does not handle.
