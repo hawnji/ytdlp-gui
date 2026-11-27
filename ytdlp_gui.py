@@ -815,6 +815,466 @@ class Worker(threading.Thread):
         self.q.put(('finished', ok))
 
 
+def fmt_time(sec):
+    """90.5 -> '1:30.5', 3723 -> '1:02:03'."""
+    if sec is None:
+        return ''
+    sec = max(0.0, float(sec))
+    whole = int(sec)
+    tenths = int(round((sec - whole) * 10))
+    if tenths == 10:
+        whole, tenths = whole + 1, 0
+    h, rem = divmod(whole, 3600)
+    m, s = divmod(rem, 60)
+    out = f'{h}:{m:02d}:{s:02d}' if h else f'{m}:{s:02d}'
+    return out + (f'.{tenths}' if tenths else '')
+
+
+_NO_WINDOW = 0x08000000 if sys.platform.startswith('win') else 0
+
+
+def _run_ffmpeg(args, timeout=60):
+    ff = shutil.which('ffmpeg')
+    if not ff:
+        raise RuntimeError('FFmpeg was not found, so previews are not available.')
+    r = subprocess.run([ff, '-hide_banner', '-loglevel', 'error', '-nostdin', *args],
+                       capture_output=True, timeout=timeout, creationflags=_NO_WINDOW)
+    if r.returncode != 0:
+        msg = (r.stderr or b'').decode('utf-8', 'replace').strip().splitlines()
+        raise RuntimeError(msg[-1] if msg else f'FFmpeg failed ({r.returncode})')
+    return r.stdout
+
+
+def _ff_input(src, seek=None):
+    url, headers = src
+    args = []
+    if seek:
+        args += ['-ss', f'{seek:.3f}']
+    if headers:
+        args += ['-headers', ''.join(f'{k}: {v}\r\n' for k, v in headers.items())]
+    return args + ['-i', url]
+
+
+def _pick_stream(formats, want_video):
+    ok_proto = ('https', 'http', 'm3u8', 'm3u8_native')
+    cands = []
+    for f in formats or []:
+        if not f.get('url') or (f.get('protocol') or 'https') not in ok_proto:
+            continue
+        has_v = f.get('vcodec') != 'none'
+        has_a = f.get('acodec') != 'none'
+        if want_video and has_v:
+            # small and over plain HTTP(S) seeks fastest
+            cands.append(((f.get('protocol') or 'https').startswith('m3u8'), abs((f.get('height') or 360) - 360), f))
+        elif not want_video and has_a:
+            cands.append((has_v, (f.get('protocol') or 'https').startswith('m3u8'), -(f.get('abr') or f.get('tbr') or 0), f))
+    if not cands:
+        return None
+    cands.sort(key=lambda c: c[:-1])
+    return cands[0][-1]
+
+
+def preview_source(url, settings):
+    """Look up one video/song and pick streams for previewing (no download)."""
+    opts = dict(yt_dlp.parse_options(build_args({**settings, 'clip_start': '', 'clip_end': ''})).ydl_opts)
+    opts.update(noplaylist=True, playlistend=1, quiet=True, no_warnings=True, noprogress=True,
+                format='bv*+ba/b/bv*/ba', postprocessors=[], logger=GuiLogger(queue.Queue()))
+    for k in ('download_ranges', 'force_keyframes_at_cuts', 'download_archive'):
+        opts.pop(k, None)
+    with make_ydl(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if info and info.get('_type') in ('playlist', 'multi_video'):
+            entries = [e for e in (info.get('entries') or []) if e]
+            if not entries:
+                raise RuntimeError('That playlist is empty.')
+            info = entries[0]
+        if not info:
+            raise RuntimeError('Could not read that link.')
+
+        def src(f):
+            if not f:
+                return None
+            headers = dict(f.get('http_headers') or {})
+            try:
+                cookie = ydl.cookiejar.get_cookie_header(f['url'])
+                if cookie:
+                    headers['Cookie'] = cookie
+            except Exception:
+                pass
+            return f['url'], headers
+
+        formats = info.get('formats') or ([info] if info.get('url') else [])
+        return {
+            'title': info.get('title') or url,
+            'duration': float_or_none(info.get('duration')),
+            'video': src(_pick_stream(formats, True)),
+            'audio': src(_pick_stream(formats, False)),
+            'url': info.get('webpage_url') or url,
+            'live': bool(info.get('is_live')),
+        }
+
+
+def probe_duration(src):
+    """Length in seconds via ffprobe, for sources that don't report one."""
+    ff = shutil.which('ffprobe')
+    if not ff:
+        return None
+    url, headers = src
+    hdr = ['-headers', ''.join(f'{k}: {v}\r\n' for k, v in headers.items())] if headers else []
+    try:
+        r = subprocess.run([ff, '-v', 'error', *hdr, '-show_entries', 'format=duration', '-of', 'csv=p=0', url],
+                           capture_output=True, timeout=30, creationflags=_NO_WINDOW)
+        return float_or_none(r.stdout.decode().strip())
+    except Exception:
+        return None
+
+
+def grab_frame(src, t, width=640, height=None):
+    """PNG bytes of the frame at t seconds."""
+    vf = (f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
+          f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black' if height else f'scale={width}:-2')
+    return _run_ffmpeg([*_ff_input(src, t), '-frames:v', '1', '-vf', vf,
+                        '-f', 'image2pipe', '-vcodec', 'png', '-'], timeout=45)
+
+
+def render_waveform(src, width, height, color='#d97757'):
+    """PNG bytes of the whole track's waveform."""
+    return _run_ffmpeg([*_ff_input(src), '-filter_complex',
+                        f'aformat=channel_layouts=mono,showwavespic=s={width}x{height}:colors={color}:scale=sqrt',
+                        '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'], timeout=180)
+
+
+def audio_snippet(src, t, seconds, path):
+    """Write `seconds` of audio starting at t to a WAV file."""
+    _run_ffmpeg(['-y', *_ff_input(src, t), '-t', f'{seconds:.2f}', '-vn', '-ac', '2', '-ar', '44100',
+                 '-c:a', 'pcm_s16le', path], timeout=60)
+    return path
+
+
+class PreviewWindow(tk.Toplevel):
+    """Scrub through a video (frames) or song (waveform), listen, and pick clip start/end."""
+    PV_W, PV_H = 640, 360          # frame preview
+    TL_W, TL_H, THUMBS = 800, 56, 8  # timeline strip
+
+    def __init__(self, app, url):
+        super().__init__(app)
+        import base64
+        import tempfile
+        self._b64 = base64.b64encode
+        self.app, self.url = app, url
+        p = self.p = app.palette
+        self.title('Preview & clip')
+        self.configure(bg=p['bg'])
+        self.transient(app)
+        self.resizable(False, False)
+        self.q = queue.Queue()
+        self.src = None
+        self.duration = None
+        self.t = 0.0
+        self.start = self.end = None
+        self._req = 0
+        self._inflight = self._want = False
+        self._debounce = None
+        self._frame_img = None
+        self._strip_imgs = []
+        self._closed = False
+        self._snip_n = 0
+        self._tmp = tempfile.mkdtemp(prefix='ytdlp_gui_preview_')
+        try:
+            import winsound
+            self._winsound = winsound
+        except ImportError:
+            self._winsound = None
+        try:
+            cr = clip_range(app._collect())
+        except SettingsError:
+            cr = None
+        if cr:
+            self.start, self.end = cr
+
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill='both', expand=True)
+        self.lbl_title = ttk.Label(outer, text='Loading…', style='Head.TLabel', wraplength=self.TL_W)
+        self.lbl_title.pack(anchor='w')
+
+        self.pv = tk.Canvas(outer, width=self.PV_W, height=self.PV_H, bg='#000000', highlightthickness=0)
+        self.pv.pack(pady=(8, 8))
+        self.pv_img = self.pv.create_image(self.PV_W // 2, self.PV_H // 2)
+        self.pv_text = self.pv.create_text(self.PV_W // 2, self.PV_H // 2, text='Looking up the video…',
+                                           fill='#cccccc', font=('Segoe UI', 11), width=self.PV_W - 60,
+                                           justify='center')
+
+        self.tl = tk.Canvas(outer, width=self.TL_W, height=self.TL_H + 18, bg=p['field'],
+                            highlightthickness=1, highlightbackground=p['border'], cursor='hand2')
+        self.tl.pack()
+        for seq in ('<Button-1>', '<B1-Motion>'):
+            self.tl.bind(seq, lambda e: self._seek(e.x / self.TL_W * (self.duration or 0)))
+
+        ctl = ttk.Frame(outer)
+        ctl.pack(fill='x', pady=(8, 0))
+        for text, d in (('−5s', -5), ('−1s', -1)):
+            ttk.Button(ctl, text=text, width=4, command=lambda d=d: self._nudge(d)).pack(side='left', padx=(0, 3))
+        self.lbl_time = ttk.Label(ctl, text='0:00', style='Head.TLabel', width=12, anchor='center')
+        self.lbl_time.pack(side='left', padx=4)
+        for text, d in (('+1s', 1), ('+5s', 5)):
+            ttk.Button(ctl, text=text, width=4, command=lambda d=d: self._nudge(d)).pack(side='left', padx=(3, 0))
+        ttk.Button(ctl, text='Set start  [', command=self._set_start).pack(side='left', padx=(16, 3))
+        ttk.Button(ctl, text='Set end  ]', command=self._set_end).pack(side='left', padx=3)
+        self.btn_stop = ttk.Button(ctl, text='■', width=3, command=self._stop_sound)
+        self.btn_hear = ttk.Button(ctl, text='▶ Hear 5 s', command=self._hear)
+        if self._winsound:
+            self.btn_stop.pack(side='right')
+            self.btn_hear.pack(side='right', padx=(0, 3))
+
+        bot = ttk.Frame(outer)
+        bot.pack(fill='x', pady=(10, 0))
+        self.lbl_sel = ttk.Label(bot, text='')
+        self.lbl_sel.pack(side='left')
+        ttk.Button(bot, text='Apply', style='Accent.TButton', command=self._apply).pack(side='right')
+        ttk.Button(bot, text='Cancel', command=self._close).pack(side='right', padx=6)
+        ttk.Button(bot, text='Clear', command=self._clear).pack(side='right')
+        self.lbl_hint = ttk.Label(outer, style='Hint.TLabel',
+                                  text='Click or drag on the timeline · ←/→ 1 s · Shift+←/→ 5 s · [ ] set start/end'
+                                       + (' · Space to hear' if self._winsound else ''))
+        self.lbl_hint.pack(anchor='w', pady=(6, 0))
+
+        self.bind('<Left>', lambda e: self._nudge(-1))
+        self.bind('<Right>', lambda e: self._nudge(1))
+        self.bind('<Shift-Left>', lambda e: self._nudge(-5))
+        self.bind('<Shift-Right>', lambda e: self._nudge(5))
+        self.bind('[', lambda e: self._set_start())
+        self.bind(']', lambda e: self._set_end())
+        self.bind('<space>', lambda e: self._hear())
+        self.bind('<Escape>', lambda e: self._close())
+        self.protocol('WM_DELETE_WINDOW', self._close)
+
+        self._update_labels()
+        app._set_titlebar(self)
+        self.focus_set()
+        self._bg(lambda: ('src', self._load()))
+        self.after(40, self._pump)
+
+    # ---- background work ----
+    def _bg(self, fn):
+        def run():
+            try:
+                self.q.put(fn())
+            except Exception as e:
+                self.q.put(('error', str(e).replace('ERROR: ', '')))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _load(self):
+        src = preview_source(self.url, self.app._collect())
+        if not src['duration'] and not src['live']:
+            s = src['video'] or src['audio']
+            src['duration'] = probe_duration(s) if s else None
+        return src
+
+    def _pump(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                item = self.q.get_nowait()
+                kind = item[0]
+                if kind == 'src':
+                    self._on_src(item[1])
+                elif kind == 'frame':
+                    _, rid, png = item
+                    self._inflight = False
+                    if rid == self._req and png:
+                        self._frame_img = tk.PhotoImage(data=self._b64(png).decode())
+                        self.pv.itemconfigure(self.pv_img, image=self._frame_img)
+                        self.pv.itemconfigure(self.pv_text, text='')
+                    if self._want:
+                        self._want = False
+                        self._fetch_frame()
+                elif kind == 'frame_error':
+                    self._inflight = False
+                    self.pv.itemconfigure(self.pv_text, text=f"Couldn't load this frame:\n{item[1]}")
+                elif kind == 'thumb':
+                    _, i, png = item
+                    img = tk.PhotoImage(data=self._b64(png).decode())
+                    self._strip_imgs.append(img)
+                    w = self.TL_W // self.THUMBS
+                    self.tl.create_image(i * w, 0, image=img, anchor='nw', tags='bgimg')
+                    self.tl.tag_raise('ov')
+                elif kind == 'wave':
+                    img = tk.PhotoImage(data=self._b64(item[1]).decode())
+                    self._strip_imgs.append(img)
+                    self.tl.create_image(0, 0, image=img, anchor='nw', tags='bgimg')
+                    self.tl.tag_raise('ov')
+                elif kind == 'snip':
+                    self.btn_hear.configure(text='▶ Hear 5 s')
+                    try:
+                        w = self._winsound
+                        w.PlaySound(item[1], w.SND_FILENAME | w.SND_ASYNC | w.SND_NODEFAULT)
+                    except Exception as e:
+                        self.lbl_sel.configure(text=f'Could not play audio: {e}')
+                elif kind == 'snip_error':
+                    self.btn_hear.configure(text='▶ Hear 5 s')
+                    self.lbl_sel.configure(text=f"Couldn't get audio here: {item[1]}")
+                elif kind == 'error':
+                    self.lbl_title.configure(text='Preview not available')
+                    self.pv.itemconfigure(self.pv_text, text=item[1])
+        except queue.Empty:
+            pass
+        self.after(40, self._pump)
+
+    def _on_src(self, src):
+        self.src = src
+        self.duration = src['duration']
+        self.lbl_title.configure(text=src['title'])
+        if src['live'] or not self.duration:
+            self.pv.itemconfigure(self.pv_text, text="This can't be previewed: live streams and links without a "
+                                                     'known length have no timeline.')
+            return
+        if self.end is not None and self.end > self.duration:
+            self.end = None
+        self._draw_ticks()
+        if src['video']:
+            self.pv.itemconfigure(self.pv_text, text='Loading frame…')
+            for i in range(self.THUMBS):
+                t = self.duration * (i + 0.5) / self.THUMBS
+                self._bg(lambda i=i, t=t: ('thumb', i, grab_frame(src['video'], t, self.TL_W // self.THUMBS,
+                                                                   self.TL_H)))
+        else:
+            self.pv.itemconfigure(self.pv_text, text='♪  Audio only\n\nUse the waveform below to find your spot'
+                                  + (', and ▶ Hear to listen.' if self._winsound else '.'))
+            if src['audio']:
+                self._bg(lambda: ('wave', render_waveform(src['audio'], self.TL_W, self.TL_H, self.p['accent'])))
+        if not (src['audio'] or src['video']):
+            self.btn_hear.state(['disabled'])
+        self._seek(self.start or 0, now=True)
+
+    # ---- timeline ----
+    def _x(self, t):
+        return 0 if not self.duration else max(0, min(self.TL_W, t / self.duration * self.TL_W))
+
+    def _draw_ticks(self):
+        self.tl.delete('tick')
+        for f in (0, 0.25, 0.5, 0.75, 1):
+            x = f * self.TL_W
+            anchor = 'nw' if f == 0 else 'ne' if f == 1 else 'n'
+            self.tl.create_text(x + (2 if f == 0 else -2 if f == 1 else 0), self.TL_H + 2,
+                                text=fmt_time(f * self.duration), anchor=anchor, fill=self.p['muted'],
+                                font=('Segoe UI', 8), tags='tick')
+
+    def _draw_overlay(self):
+        self.tl.delete('ov')
+        a = self.p['accent']
+        if self.duration and (self.start is not None or self.end is not None):
+            x1, x2 = self._x(self.start or 0), self._x(self.end if self.end is not None else self.duration)
+            self.tl.create_rectangle(x1, 1, x2, self.TL_H - 1, outline=a, width=3, tags='ov')
+            self.tl.create_rectangle(x1, self.TL_H - 5, x2, self.TL_H, fill=a, outline='', tags='ov')
+        x = self._x(self.t)
+        self.tl.create_line(x, 0, x, self.TL_H, fill='#ffffff', width=3, tags='ov')
+        self.tl.create_line(x, 0, x, self.TL_H, fill='#000000', width=1, tags='ov')
+
+    def _update_labels(self):
+        self.lbl_time.configure(text=fmt_time(self.t))
+        if self.start is None and self.end is None:
+            self.lbl_sel.configure(text='No section chosen — the whole thing will download')
+        else:
+            s = self.start or 0
+            e = self.end if self.end is not None else self.duration
+            length = f' · Length {fmt_time(e - s)}' if e is not None else ''
+            self.lbl_sel.configure(text=f'Start {fmt_time(s)} · End {fmt_time(self.end) if self.end is not None else "end"}'
+                                        + length)
+        self._draw_overlay()
+
+    # ---- moving around ----
+    def _seek(self, t, now=False):
+        if not self.duration:
+            return
+        self.t = max(0.0, min(float(t), max(0.0, self.duration - 0.05)))
+        self._update_labels()
+        if self.src and self.src['video']:
+            if self._debounce:
+                self.after_cancel(self._debounce)
+            self._debounce = self.after(1 if now else 120, self._fetch_frame)
+
+    def _nudge(self, d):
+        self._seek(self.t + d, now=True)
+
+    def _fetch_frame(self):
+        self._debounce = None
+        if self._inflight:
+            self._want = True
+            return
+        self._inflight = True
+        self._req += 1
+        rid, t, src = self._req, self.t, self.src['video']
+
+        def work():
+            try:
+                return ('frame', rid, grab_frame(src, t, self.PV_W, self.PV_H))
+            except Exception as e:
+                return ('frame_error', str(e))
+        self._bg(work)
+
+    def _set_start(self):
+        self.start = self.t
+        if self.end is not None and self.end <= self.start:
+            self.end = None
+        self._update_labels()
+
+    def _set_end(self):
+        if self.t <= (self.start or 0):
+            self.lbl_sel.configure(text='The end has to be after the start — move right first')
+            return
+        self.end = self.t
+        self._update_labels()
+
+    def _clear(self):
+        self.start = self.end = None
+        self._update_labels()
+
+    # ---- listening ----
+    def _hear(self):
+        if not self._winsound or not self.src or not self.duration:
+            return
+        s = self.src['audio'] or self.src['video']
+        if not s:
+            return
+        self._stop_sound()
+        self.btn_hear.configure(text='…')
+        self._snip_n += 1
+        path = os.path.join(self._tmp, f'snip{self._snip_n}.wav')
+        t = self.t
+
+        def work():
+            try:
+                return ('snip', audio_snippet(s, t, 5, path))
+            except Exception as e:
+                return ('snip_error', str(e))
+        self._bg(work)
+
+    def _stop_sound(self):
+        if self._winsound:
+            try:
+                self._winsound.PlaySound(None, 0)
+            except Exception:
+                pass
+
+    # ---- finish ----
+    def _apply(self):
+        s, e = self.start, self.end
+        if self.duration and e is not None and e >= self.duration - 0.05:
+            e = None  # "to the end"
+        self.app.clip_start.set(fmt_time(s) if s else '')
+        self.app.clip_end.set(fmt_time(e) if e is not None else '')
+        if s or e is not None:
+            self.app.status.set('Clip set from preview — it applies to every link in this batch')
+        self._close()
+
+    def _close(self):
+        self._closed = True
+        self._stop_sound()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        self.destroy()
+
+
 class ArgPicker(tk.Toplevel):
     """Checkbox list of every yt-dlp option, written back into 'Extra arguments'."""
 
@@ -1337,6 +1797,7 @@ class App(tk.Tk):
         self.lbl_clip.grid(row=3, column=0, sticky='w', pady=(4, 0))
         cf = ttk.Frame(out)
         cf.grid(row=3, column=1, columnspan=3, sticky='w', padx=6, pady=(4, 0))
+        ttk.Button(cf, text='Preview…', command=self._open_preview).pack(side='left', padx=(0, 10))
         ttk.Label(cf, text='Start').pack(side='left')
         ttk.Entry(cf, textvariable=self.clip_start, width=9).pack(side='left', padx=(4, 10))
         ttk.Label(cf, text='End').pack(side='left')
@@ -1672,6 +2133,23 @@ class App(tk.Tk):
                 return
             self.worker.cancel.set()
         self.destroy()
+
+    def _open_preview(self):
+        urls = self._urls()
+        if not urls:
+            messagebox.showinfo(APP_NAME, 'Paste a link first, then click Preview.', parent=self)
+            return
+        url = urls[0]
+        try:  # prefer the line the text cursor is on
+            line = self.url_text.get('insert linestart', 'insert lineend').strip()
+            if line in urls:
+                url = line
+        except tk.TclError:
+            pass
+        if not shutil.which('ffmpeg'):
+            messagebox.showerror(APP_NAME, 'Previews need FFmpeg, which was not found next to the app.', parent=self)
+            return
+        PreviewWindow(self, url)
 
     # ---------- adding links: clipboard watching and drag-and-drop ----------
     def _add_urls(self, urls, source):
