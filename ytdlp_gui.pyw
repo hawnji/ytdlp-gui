@@ -57,7 +57,7 @@ except ImportError:
 
 import re
 from yt_dlp.extractor.common import InfoExtractor
-from yt_dlp.utils import ExtractorError, float_or_none, parse_iso8601, url_or_none
+from yt_dlp.utils import ExtractorError, float_or_none, parse_iso8601, traverse_obj, url_or_none
 
 
 class SunoIE(InfoExtractor):
@@ -194,7 +194,91 @@ class SunoProfileIE(InfoExtractor):
             uploader_url=f'https://suno.com/@{handle}', webpage_url=f'https://suno.com/@{handle}')
 
 
-EXTRA_EXTRACTORS = (SunoIE, SunoPlaylistIE, SunoProfileIE)
+def _walk(obj, key):
+    """Every value stored under `key` anywhere inside nested dicts/lists, in order."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop(0)
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                if k == key:
+                    yield v
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(cur, list):
+            stack.extend(cur)
+
+
+try:
+    from yt_dlp.extractor.youtube import YoutubeIE, YoutubeTabIE
+    from yt_dlp.extractor.youtube._base import YoutubeBaseInfoExtractor
+
+    class YouTubeMusicRadioIE(YoutubeBaseInfoExtractor):
+        """YouTube Music radios/mixes (watch?v=…&list=RD…). yt-dlp opens these on regular YouTube, where music
+        radios often don't exist, and then downloads only the first song. This asks YouTube Music for the queue."""
+        IE_NAME = 'youtube:music:radio'
+        _VALID_URL = r'https?://music\.youtube\.com/watch\?(?=[^#]*\blist=(?P<id>RD[\w-]+))(?=[^#]*\bv=(?P<vid>[\w-]{11}))'
+        DEFAULT_LIMIT = 50
+
+        def _real_extract(self, url):
+            m = self._match_valid_url(url)
+            list_id, video_id = m.group('id'), m.group('vid')
+            if list_id.startswith('RDCLAK'):  # albums are normal playlists: yt-dlp handles those itself
+                return self.url_result(url, YoutubeTabIE)
+            if self.get_param('noplaylist'):
+                self.to_screen(f'Downloading just the song {video_id} (playlist links are set to single video)')
+                return self.url_result(f'https://www.youtube.com/watch?v={video_id}', YoutubeIE, video_id)
+
+            limit = max(self.DEFAULT_LIMIT, self.get_param('playlistend') or 0)
+            base = {'videoId': video_id, 'playlistId': list_id, 'isAudioOnly': True,
+                    'enablePersistentPlaylistPanel': True, 'tunerSettingValue': 'AUTOMIX_SETTING_NORMAL'}
+            entries, seen, title, token = [], set(), None, None
+            for page in range(1, 21):
+                query = {**base, 'continuation': token} if token else base
+                data = self._call_api('next', query, list_id, fatal=page == 1, default_client='web_music',
+                                      note=f'Downloading YouTube Music radio page {page}')
+                if not data:
+                    break
+                if title is None:
+                    panel = next((t for t in _walk(data, 'playlistPanelRenderer') if isinstance(t, dict)), {})
+                    raw = panel.get('title')
+                    title = (raw if isinstance(raw, str)
+                             else traverse_obj(raw, ('simpleText', {str}))
+                             or ''.join(traverse_obj(raw, ('runs', ..., 'text', {str})) or []) or None)
+                new = 0
+                for r in _walk(data, 'playlistPanelVideoRenderer'):
+                    vid = isinstance(r, dict) and r.get('videoId')
+                    if not vid or vid in seen:
+                        continue
+                    seen.add(vid)
+                    new += 1
+                    entries.append(self.url_result(
+                        f'https://www.youtube.com/watch?v={vid}', YoutubeIE, vid,
+                        traverse_obj(r, ('title', 'runs', ..., 'text'), get_all=False),
+                        uploader=traverse_obj(r, ('shortBylineText', 'runs', 0, 'text'))))
+                if len(entries) >= limit or not new:
+                    break
+                token = next((c for key in ('nextRadioContinuationData', 'nextContinuationData')
+                              for d in _walk(data, key) if isinstance(d, dict) and (c := d.get('continuation'))),
+                             None)
+                if not token:
+                    break
+            if not entries:
+                self.report_warning('YouTube Music did not return the radio\'s songs; trying the regular way')
+                return self.url_result(url, YoutubeTabIE)
+            entries = entries[:limit]
+            self.to_screen(f'YouTube Music radio: {len(entries)} songs'
+                           + (' (radios are endless; the first 50 are used — set a playlist range in Extra '
+                              'arguments, e.g. --playlist-end 100, for more)' if len(entries) >= self.DEFAULT_LIMIT
+                              and not self.get_param('playlistend') else ''))
+            return self.playlist_result(entries, list_id, title or 'YouTube Music radio')
+
+    _YTM_EXTRACTORS = (YouTubeMusicRadioIE,)
+except Exception:  # a future yt-dlp may move these internals; then simply do without this extra
+    _YTM_EXTRACTORS = ()
+
+
+EXTRA_EXTRACTORS = (SunoIE, SunoPlaylistIE, SunoProfileIE, *_YTM_EXTRACTORS)
 
 
 def make_ydl(opts):
@@ -642,6 +726,7 @@ class Worker(threading.Thread):
         self._tl = threading.local()
         self._root = {}          # id(playlist item) -> the link it came from
         self._failed_roots = set()
+        self._key_roots = {}     # (site, video id) -> every pasted link that contains that video
 
     @property
     def urls(self):
@@ -757,11 +842,29 @@ class Worker(threading.Thread):
             jobs.put(job)
         add_total(len(self.jobs))
 
+        def video_key(kind, item, info=None):
+            if kind == 'url':
+                return (info.get('extractor_key') or info.get('ie_key'), info.get('id')) if info and info.get('id') else None
+            return (item.get('ie_key'), item.get('id') or item.get('url'))
+
+        def claim(key, root):
+            """True if this video should be downloaded now; False if it's already part of this batch."""
+            if not key:
+                return True
+            with self._lock:
+                roots = self._key_roots.setdefault(key, set())
+                first = not roots
+                if root:
+                    roots.add(root)
+                return first
+
         def failed(kind, item, extra, info=None):
             root = item if kind == 'url' else self._root.get(id(item))
-            if root:
-                with self._lock:
+            with self._lock:
+                if root:
                     self._failed_roots.add(root)
+                # every pasted link that shares this video failed too
+                self._failed_roots.update(self._key_roots.get(video_key(kind, item, info), ()))
             if kind in ('entry', 'entry_whole'):
                 key = item.get('id') or item.get('url')
                 title, url = item.get('title') or item.get('url'), item.get('url')
@@ -801,7 +904,10 @@ class Worker(threading.Thread):
                             self.q.put(('log', f'=== {item}'))
                             entries, info = self._expand(ydl, item)
                             if entries is None:
-                                if info is not None:
+                                if info is not None and not claim(video_key('url', item, info), item):
+                                    self.q.put(('log', f'Skipping {info.get("title") or item}: '
+                                                       'already being downloaded in this batch'))
+                                elif info is not None:
                                     ydl.process_ie_result(info, download=True)
                                 else:
                                     ydl.download([item])
@@ -827,6 +933,11 @@ class Worker(threading.Thread):
                                     jobs.put((entry_kind, entry, ex))
                                 add_total(len(entries) - 1)  # the playlist itself was a placeholder
                                 continue
+                        elif not claim(video_key(kind, item), self._root.get(id(item))):
+                            self.q.put(('log', f'Skipping {item.get("title") or item.get("url")}: '
+                                               'already being downloaded in this batch'))
+                            if item.get('id'):
+                                self.q.put(('item_dup', {'key': item['id']}))
                         else:
                             ydl_for(kind).process_ie_result(dict(item), download=True, extra_info=extra)
                         if getattr(self._tl, 'errors', 0) > before:
@@ -2466,7 +2577,7 @@ class App(tk.Tk):
     def _start(self, jobs=None):
         if self._busy() or self._updating:
             return
-        urls = jobs or self._urls()
+        urls = jobs or list(dict.fromkeys(self._urls()))  # the same link twice only downloads once
         if not urls:
             messagebox.showinfo(APP_NAME, 'Paste at least one URL first.')
             return
@@ -2941,6 +3052,10 @@ class App(tk.Tk):
                     choice = self._ask_clip_many(f'"{data["title"]}" has {data["n"]} items', clip)
                     data['box']['answer'] = 'clip' if choice else 'whole' if choice is False else 'cancel'
                     data['event'].set()
+                elif kind == 'item_dup':
+                    iid = self.rows.get(data['key'])
+                    if iid and self.tree.set(iid, 'status') == 'Queued':
+                        self.tree.set(iid, 'status', 'In batch already')
                 elif kind == 'urls_done':
                     if self.clear_done.get() and data['done']:
                         n = self._remove_urls(data['done'])
