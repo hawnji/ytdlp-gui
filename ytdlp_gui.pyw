@@ -469,7 +469,9 @@ def build_args(s):
         if s['subs']:
             args += ['--write-subs', '--sub-langs', s['sub_langs'] or 'en.*', '--embed-subs']
 
-    if s['embed_thumb']:
+    # WAV has no standard place for cover art; yt-dlp would report an error
+    wav = s['mode'] == 'audio' and s['audio_format'] == 'wav'
+    if s['embed_thumb'] and not wav:
         args += ['--embed-thumbnail']
     if s['metadata']:
         args += ['--embed-metadata']
