@@ -23,8 +23,8 @@ if not exist ".build-venv\Scripts\python.exe" ( %PY% -m venv .build-venv || goto
 set "VPY=%~dp0.build-venv\Scripts\python.exe"
 "%VPY%" -m pip install --upgrade pip --quiet
 
-echo [2/4] Installing yt-dlp, its dependencies, Deno and PyInstaller...
-"%VPY%" -m pip install --upgrade "yt-dlp[default,deno]" pyinstaller --quiet || goto :fail
+echo [2/4] Installing yt-dlp, its dependencies, Deno, curl_cffi and PyInstaller...
+"%VPY%" -m pip install --upgrade "yt-dlp[default,deno,curl-cffi]" pyinstaller --quiet || goto :fail
 
 echo [3/4] Building the .exe (this takes a minute or two)...
 "%VPY%" -m PyInstaller --noconfirm --clean --onefile --windowed ^
