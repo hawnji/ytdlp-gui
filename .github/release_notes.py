@@ -11,6 +11,8 @@ import subprocess
 import sys
 
 TRAILERS = ('co-authored-by:', 'claude-session:', 'signed-off-by:')
+# Only changes to these files are news for people using the app (README edits, release tooling etc. are not)
+APP_FILES = ('ytdlp_gui.py', 'ytdlp_gui.pyw', 'build_exe.bat', '.github/workflows/build-gui-exe.yml')
 FOOTER = ('Update with **Update now** inside the app, or download the zip below, unblock it '
           '(right-click → Properties → Unblock) and unzip it. Keep ffmpeg.exe, ffprobe.exe and deno.exe '
           'next to yt-dlp GUI.exe.')
@@ -27,7 +29,7 @@ def is_commit(sha):
 def commits_between(prev_sha, sha):
     """[(subject, [detail, ...]), ...] for commits after prev_sha up to sha (or just sha if no prev)."""
     rng = [f'{prev_sha}..{sha}'] if prev_sha else ['-1', sha]
-    raw = git('log', '--reverse', '--no-merges', '--format=%x1e%s%x1f%b', *rng)
+    raw = git('log', '--reverse', '--no-merges', '--format=%x1e%s%x1f%b', *rng, '--', *APP_FILES)
     changes = []
     for entry in raw.split('\x1e'):
         if not entry.strip():
