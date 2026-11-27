@@ -37,6 +37,20 @@ jobs:
           $ver = python -c "import yt_dlp.version as v; print(v.__version__)"
           "ytdlp=$ver" >> $env:GITHUB_OUTPUT
           $skip = 'false'
+          # A push that only touches docs/tooling (README, patch-note data, other workflows) is not a new app version
+          if ('${{ github.event_name }}' -eq 'push') {
+            $prevNotes = (gh release view --json body --jq .body 2>$null) -join "`n"
+            $m = [regex]::Match($prevNotes, 'commit:\s*([0-9a-f]{40})')
+            if ($m.Success) {
+              $changed = git diff --name-only $m.Groups[1].Value '${{ github.sha }}'
+              $appFiles = $changed | Where-Object { $_ -match '^(ytdlp_gui\.pyw?|build_exe\.bat)$' }
+              if ($changed -and -not $appFiles) {
+                $skip = 'true'
+                Write-Host "Only non-app files changed since the last release - no new release:"
+                $changed | ForEach-Object { Write-Host "  $_" }
+              }
+            }
+          }
           if ('${{ github.event_name }}' -eq 'schedule') {
             $notes = gh release view --json body --jq .body 2>$null
             if ($notes -match [regex]::Escape("yt-dlp: $ver") -and $notes -match '${{ github.sha }}') {

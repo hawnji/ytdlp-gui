@@ -1,0 +1,41 @@
+name: Fix old release labels
+
+# Run by hand from the Actions tab. Points each release's tag (build-0001, build-0002, ...) back at the
+# code that build was really made from, as listed in .github/release_commits.json. Only the
+# "Source code" downloads on those release pages change; the app downloads and notes stay as they are.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Re-point release tags
+        shell: python
+        run: |
+          import json, subprocess
+          commits = json.load(open('.github/release_commits.json'))
+          fixed = 0
+          for key, sha in commits.items():
+              if not key.isdigit():
+                  continue
+              tag = f'build-{int(key):04d}'
+              cur = subprocess.run(['git', 'rev-parse', '-q', '--verify', f'refs/tags/{tag}^{{commit}}'],
+                                   capture_output=True, text=True).stdout.strip()
+              if not cur:
+                  print(f'{tag}: no such tag, skipped')
+              elif cur == sha:
+                  print(f'{tag}: already correct ({sha[:7]})')
+              else:
+                  subprocess.run(['git', 'push', '-f', 'origin', f'{sha}:refs/tags/{tag}'], check=True)
+                  print(f'{tag}: {cur[:7]} -> {sha[:7]}')
+                  fixed += 1
+          print(f'{fixed} label(s) fixed')
