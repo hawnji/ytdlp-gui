@@ -910,7 +910,8 @@ class _RangeRelay:
                 threading.Thread(target=self.server.serve_forever, daemon=True).start()
             token = secrets.token_hex(8)
             self.streams[token] = {'url': url, 'headers': dict(headers or {}), 'size': size,
-                                   'chunk': chunk or self.CHUNK}
+                                   'chunk': chunk or self.CHUNK,
+                                   'slots': threading.BoundedSemaphore(3)}  # hosts dislike many at once
             return f'http://127.0.0.1:{self.server.server_address[1]}/s/{token}'
 
     def owns(self, url):
@@ -922,10 +923,18 @@ class _RangeRelay:
         return urllib.request.urlopen(req, timeout=30, context=_https_context())
 
     def _size(self, st):
-        if not st['size']:
-            with self._open(st, 0, 0) as r:
-                m = re.search(r'/(\d+)', r.headers.get('Content-Range') or '')
-                st['size'] = int(m.group(1)) if m else None
+        for attempt in range(3):
+            if st['size']:
+                break
+            try:
+                with st['slots'], self._open(st, 0, 0) as r:
+                    m = re.search(r'/(\d+)', r.headers.get('Content-Range') or '')
+                    st['size'] = int(m.group(1)) if m else None
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(0.6 * (attempt + 1))
         return st['size']
 
     def _serve(self, h, head=False):
@@ -964,21 +973,31 @@ class _RangeRelay:
         h.end_headers()
         if head:
             return
-        pos = a
-        try:
-            while pos <= b:
-                end = min(b, pos + st['chunk'] - 1)
-                with self._open(st, pos, end) as r:
+        pos, failures = a, 0
+        while pos <= b:
+            end = min(b, pos + st['chunk'] - 1)
+            got = 0
+            try:
+                with st['slots'], self._open(st, pos, end) as r:
                     while pos <= end:
                         data = r.read(min(65536, end - pos + 1))
                         if not data:
                             break
-                        h.wfile.write(data)
+                        try:
+                            h.wfile.write(data)
+                        except OSError:
+                            return  # FFmpeg hung up: it has what it needed
                         pos += len(data)
+                        got += len(data)
                 if pos <= end:
-                    break  # the host sent less than asked; stop instead of looping
-        except OSError:
-            pass  # FFmpeg hung up after getting what it needed, or the host failed
+                    raise OSError('the host sent less than asked')
+                failures = 0
+            except Exception:
+                # the host refused or dropped this piece: try again from where we got to
+                failures = 0 if got else failures + 1
+                if failures > 3:
+                    return
+                time.sleep(0.5 * failures)
 
 
 _RANGE_RELAY = _RangeRelay()
@@ -1108,7 +1127,10 @@ class PreviewWindow(tk.Toplevel):
         self.title('Preview & clip')
         self.configure(bg=p['bg'])
         self.transient(app)
-        self.resizable(False, False)
+        self.minsize(720, 560)
+        self._resize_job = None
+        self._frame_job = None
+        self._strip_gen = 0
         self.q = queue.Queue()
         self.src = None
         self.duration = None
@@ -1136,11 +1158,14 @@ class PreviewWindow(tk.Toplevel):
 
         outer = ttk.Frame(self, padding=10)
         outer.pack(fill='both', expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)  # the frame preview takes any extra room
         self.lbl_title = ttk.Label(outer, text='Loading…', style='Head.TLabel', wraplength=self.TL_W)
-        self.lbl_title.pack(anchor='w')
+        self.lbl_title.grid(row=0, column=0, sticky='w')
 
         self.pv = tk.Canvas(outer, width=self.PV_W, height=self.PV_H, bg='#000000', highlightthickness=0)
-        self.pv.pack(pady=(8, 8))
+        self.pv.grid(row=1, column=0, sticky='nsew', pady=(8, 8))
+        self.pv.bind('<Configure>', self._on_pv_resize)
         self.pv_img = self.pv.create_image(self.PV_W // 2, self.PV_H // 2)
         self.pv_text = self.pv.create_text(self.PV_W // 2, self.PV_H // 2, text='Looking up the video…',
                                            fill='#cccccc', font=('Segoe UI', 11), width=self.PV_W - 60,
@@ -1148,7 +1173,8 @@ class PreviewWindow(tk.Toplevel):
 
         self.tl = tk.Canvas(outer, width=self.TL_W, height=self.TL_H + 18, bg=p['field'],
                             highlightthickness=1, highlightbackground=p['border'], cursor='hand2')
-        self.tl.pack()
+        self.tl.grid(row=2, column=0, sticky='ew')
+        self.tl.bind('<Configure>', self._on_tl_resize)
         self._drag = None
         self.tl.bind('<Button-1>', self._tl_press)
         self.tl.bind('<B1-Motion>', self._tl_motion)
@@ -1158,10 +1184,10 @@ class PreviewWindow(tk.Toplevel):
         self._syncing = False
         self.scale = ttk.Scale(outer, from_=0, to=1, orient='horizontal', length=self.TL_W,
                                variable=self.pos, command=self._on_scale, style='Seek.Horizontal.TScale')
-        self.scale.pack(pady=(6, 0))
+        self.scale.grid(row=3, column=0, sticky='ew', pady=(6, 0))
 
         ctl = ttk.Frame(outer)
-        ctl.pack(fill='x', pady=(8, 0))
+        ctl.grid(row=4, column=0, sticky='ew', pady=(8, 0))
         for text, d in (('−5s', -5), ('−1s', -1)):
             ttk.Button(ctl, text=text, width=4, command=lambda d=d: self._nudge(d)).pack(side='left', padx=(0, 3))
         self.lbl_time = ttk.Label(ctl, text='0:00', style='Head.TLabel', width=12, anchor='center')
@@ -1177,7 +1203,7 @@ class PreviewWindow(tk.Toplevel):
             self.btn_hear.pack(side='right', padx=(0, 3))
 
         bot = ttk.Frame(outer)
-        bot.pack(fill='x', pady=(10, 0))
+        bot.grid(row=5, column=0, sticky='ew', pady=(10, 0))
         self.lbl_sel = ttk.Label(bot, text='')
         self.lbl_sel.pack(side='left')
         ttk.Button(bot, text='Apply', style='Accent.TButton', command=self._apply).pack(side='right')
@@ -1185,8 +1211,9 @@ class PreviewWindow(tk.Toplevel):
         ttk.Button(bot, text='Clear', command=self._clear).pack(side='right')
         self.lbl_hint = ttk.Label(outer, style='Hint.TLabel',
                                   text='Click or drag on the timeline · ←/→ 1 s · Shift+←/→ 5 s · [ ] set start/end'
-                                       + (' · Space to hear' if self._winsound else ''))
-        self.lbl_hint.pack(anchor='w', pady=(6, 0))
+                                       + (' · Space to hear' if self._winsound else '')
+                                       + ' · Make the window bigger for a finer timeline')
+        self.lbl_hint.grid(row=6, column=0, sticky='w', pady=(6, 0))
 
         self.bind('<Left>', lambda e: self._nudge(-1))
         self.bind('<Right>', lambda e: self._nudge(1))
@@ -1205,12 +1232,12 @@ class PreviewWindow(tk.Toplevel):
         self.after(40, self._pump)
 
     # ---- background work ----
-    def _bg(self, fn):
+    def _bg(self, fn, on_error='error'):
         def run():
             try:
                 self.q.put(fn())
             except Exception as e:
-                self.q.put(('error', str(e).replace('ERROR: ', '')))
+                self.q.put((on_error, str(e).replace('ERROR: ', '')))
         threading.Thread(target=run, daemon=True).start()
 
     def _load(self):
@@ -1232,6 +1259,7 @@ class PreviewWindow(tk.Toplevel):
                 elif kind == 'frame':
                     _, rid, png = item
                     self._inflight = False
+                    self._frame_retry = 0
                     if rid == self._req and png:
                         self._frame_img = tk.PhotoImage(data=self._b64(png).decode())
                         self.pv.itemconfigure(self.pv_img, image=self._frame_img)
@@ -1239,21 +1267,42 @@ class PreviewWindow(tk.Toplevel):
                     if self._want:
                         self._want = False
                         self._fetch_frame()
+                    self._start_strip_once()
                 elif kind == 'frame_error':
                     self._inflight = False
-                    self.pv.itemconfigure(self.pv_text, text=f"Couldn't load this frame:\n{item[1]}")
+                    if self._want:
+                        self._want = False
+                        self._fetch_frame()
+                    elif getattr(self, '_frame_retry', 0) < 2:  # hosts sometimes refuse once; try again
+                        self._frame_retry = getattr(self, '_frame_retry', 0) + 1
+                        self.pv.itemconfigure(self.pv_text, text='Loading frame… (retrying)')
+                        self._debounce = self.after(800 * self._frame_retry, self._fetch_frame)
+                    else:
+                        self._frame_retry = 0
+                        self._frame_img = None
+                        self.pv.itemconfigure(self.pv_img, image='')
+                        self.pv.itemconfigure(self.pv_text, text=f"Couldn't load this frame:\n{item[1]}\n\n"
+                                                                 'Move the slider to try another spot.')
+                    self._start_strip_once()
+                elif kind == 'strip_error':
+                    self._strip_failed = getattr(self, '_strip_failed', 0) + 1
+                    if self._strip_failed == 1:
+                        self.lbl_hint.configure(text="Some timeline thumbnails couldn't load — the timeline "
+                                                     'and frame preview still work.')
                 elif kind == 'thumb':
-                    _, i, png = item
-                    img = tk.PhotoImage(data=self._b64(png).decode())
-                    self._strip_imgs.append(img)
-                    w = self.TL_W // self.THUMBS
-                    self.tl.create_image(i * w, 0, image=img, anchor='nw', tags='bgimg')
-                    self.tl.tag_raise('ov')
+                    _, gen, x, png = item
+                    if gen == self._strip_gen:  # ignore thumbnails made for an older window size
+                        img = tk.PhotoImage(data=self._b64(png).decode())
+                        self._strip_imgs.append(img)
+                        self.tl.create_image(x, 0, image=img, anchor='nw', tags='bgimg')
+                        self.tl.tag_raise('ov')
                 elif kind == 'wave':
-                    img = tk.PhotoImage(data=self._b64(item[1]).decode())
-                    self._strip_imgs.append(img)
-                    self.tl.create_image(0, 0, image=img, anchor='nw', tags='bgimg')
-                    self.tl.tag_raise('ov')
+                    _, gen, png = item
+                    if gen == self._strip_gen:
+                        img = tk.PhotoImage(data=self._b64(png).decode())
+                        self._strip_imgs.append(img)
+                        self.tl.create_image(0, 0, image=img, anchor='nw', tags='bgimg')
+                        self.tl.tag_raise('ov')
                 elif kind == 'snip':
                     self.btn_hear.configure(text='▶ Hear 5 s')
                     try:
@@ -1285,18 +1334,80 @@ class PreviewWindow(tk.Toplevel):
         self._draw_ticks()
         if src['video']:
             self.pv.itemconfigure(self.pv_text, text='Loading frame…')
-            for i in range(self.THUMBS):
-                t = self.duration * (i + 0.5) / self.THUMBS
-                self._bg(lambda i=i, t=t: ('thumb', i, grab_frame(src['video'], t, self.TL_W // self.THUMBS,
-                                                                   self.TL_H)))
+            self._strip_started = False  # thumbnails start once the first frame is in (or failed)
+            self.after(4000, self._start_strip_once)  # ...or after a few seconds regardless
         else:
             self.pv.itemconfigure(self.pv_text, text='♪  Audio only\n\nUse the waveform below to find your spot'
                                   + (', and ▶ Hear to listen.' if self._winsound else '.'))
-            if src['audio']:
-                self._bg(lambda: ('wave', render_waveform(src['audio'], self.TL_W, self.TL_H, self.p['accent'])))
+            self._strip_started = True
+            self._rebuild_strip()
         if not (src['audio'] or src['video']):
             self.btn_hear.state(['disabled'])
         self._seek(self.start or 0, now=True)
+
+    # ---- resizing ----
+    _thumb_slots = threading.Semaphore(4)  # don't start dozens of FFmpegs at once
+
+    def _start_strip_once(self):
+        if not getattr(self, '_strip_started', True) and not self._closed:
+            self._strip_started = True
+            self._rebuild_strip()
+
+    def _rebuild_strip(self):
+        """(Re)make the thumbnail strip or waveform for the current timeline width."""
+        self._resize_job = None
+        src = self.src
+        if not src or not self.duration:
+            return
+        self._strip_gen += 1
+        gen, width = self._strip_gen, self.TL_W
+        self.tl.delete('bgimg')
+        self._strip_imgs = []
+        if src['video']:
+            n = max(4, round(width / 100))  # about one thumbnail per 100 px
+            for i in range(n):
+                x0, x1 = round(i * width / n), round((i + 1) * width / n)
+                t = self.duration * (i + 0.5) / n
+
+                def job(x0=x0, w=x1 - x0, t=t):
+                    with self._thumb_slots:
+                        if gen != self._strip_gen or self._closed:
+                            return ('thumb', -1, 0, b'')
+                        return ('thumb', gen, x0, grab_frame(src['video'], t, w, self.TL_H))
+                self._bg(job, on_error='strip_error')
+        elif src['audio']:
+            self._bg(lambda: ('wave', gen, render_waveform(src['audio'], width, self.TL_H, self.p['accent'])),
+                     on_error='strip_error')
+
+    def _on_tl_resize(self, e):
+        if abs(e.width - self.TL_W) < 2:
+            return
+        self.TL_W = e.width
+        self.lbl_title.configure(wraplength=max(200, e.width))
+        self.lbl_hint.configure(wraplength=max(200, e.width))
+        if self.duration:
+            self._draw_ticks()
+            self._draw_overlay()
+        if self._resize_job:
+            self.after_cancel(self._resize_job)
+        if getattr(self, '_strip_started', True):
+            self._resize_job = self.after(350, self._rebuild_strip)  # once the user stops dragging the edge
+
+    def _on_pv_resize(self, e):
+        if (e.width, e.height) == (self.PV_W, self.PV_H):
+            return
+        self.PV_W, self.PV_H = e.width, e.height
+        self.pv.coords(self.pv_img, e.width // 2, e.height // 2)
+        self.pv.coords(self.pv_text, e.width // 2, e.height // 2)
+        self.pv.itemconfigure(self.pv_text, width=max(100, e.width - 60))
+        if self.src and self.src['video']:
+            if self._frame_job:
+                self.after_cancel(self._frame_job)
+            self._frame_job = self.after(350, self._refetch_frame)
+
+    def _refetch_frame(self):
+        self._frame_job = None
+        self._fetch_frame()
 
     # ---- timeline ----
     def _x(self, t):
@@ -1476,6 +1587,12 @@ class PreviewWindow(tk.Toplevel):
 
     def _close(self):
         self._closed = True
+        for job in (self._resize_job, self._frame_job, self._debounce):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
         self._stop_sound()
         shutil.rmtree(self._tmp, ignore_errors=True)
         self.destroy()

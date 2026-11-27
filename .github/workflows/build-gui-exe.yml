@@ -16,6 +16,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history and tags, for patch notes and tag clean-up
 
       - uses: actions/setup-python@v5
         with:
@@ -79,12 +81,46 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path App\* -DestinationPath "yt-dlp-GUI-windows.zip"
 
+      - name: Rename old release tags so they sort correctly (build-9 -> build-0009)
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # GitHub lists releases by tag name as text, so build-9 sorted above build-16.
+          # Zero-padded tags sort correctly; the app's updater reads both forms.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          $tags = gh release list --limit 500 --json tagName --jq '.[].tagName'
+          foreach ($old in $tags) {
+            if ($old -match '^build-(\d{1,3})$') {
+              $new = 'build-{0:D4}' -f [int]$Matches[1]
+              $sha = git rev-list -n 1 $old
+              git tag -f $new $sha
+              git push -f origin "refs/tags/${new}"
+              gh release edit $old --tag $new --title "yt-dlp GUI (build $([int]$Matches[1]))"
+              git push origin ":refs/tags/${old}"
+              Write-Host "Renamed $old -> $new"
+            }
+          }
+
+      - name: Write patch notes
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view --json body --jq .body > previous_notes.md 2>$null
+          if ($LASTEXITCODE -ne 0) { Set-Content previous_notes.md '' }
+          python .github/release_notes.py previous_notes.md "${{ steps.check.outputs.ytdlp }}" "${{ github.sha }}" "${{ github.run_number }}" > notes.md
+          Get-Content notes.md
+
       - name: Publish as a release
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $n = "${{ github.run_number }}"
-          $notes = "Unzip and run 'yt-dlp GUI.exe' (or use Update now inside the app). Keep ffmpeg.exe, ffprobe.exe and deno.exe in the same folder.`n`nyt-dlp: ${{ steps.check.outputs.ytdlp }}`ncommit: ${{ github.sha }}"
-          gh release create "build-$n" "yt-dlp-GUI-windows.zip" --title "yt-dlp GUI (build $n)" --notes $notes --latest
+          $n = [int]"${{ github.run_number }}"
+          $tag = 'build-{0:D4}' -f $n
+          gh release create $tag "yt-dlp-GUI-windows.zip" --title "yt-dlp GUI (build $n)" --notes-file notes.md --latest
