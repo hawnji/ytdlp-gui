@@ -1007,8 +1007,16 @@ class PreviewWindow(tk.Toplevel):
         self.tl = tk.Canvas(outer, width=self.TL_W, height=self.TL_H + 18, bg=p['field'],
                             highlightthickness=1, highlightbackground=p['border'], cursor='hand2')
         self.tl.pack()
-        for seq in ('<Button-1>', '<B1-Motion>'):
-            self.tl.bind(seq, lambda e: self._seek(e.x / self.TL_W * (self.duration or 0)))
+        self._drag = None
+        self.tl.bind('<Button-1>', self._tl_press)
+        self.tl.bind('<B1-Motion>', self._tl_motion)
+        self.tl.bind('<ButtonRelease-1>', self._tl_release)
+        self.tl.bind('<Motion>', self._tl_hover)
+        self.pos = tk.DoubleVar(value=0.0)
+        self._syncing = False
+        self.scale = ttk.Scale(outer, from_=0, to=1, orient='horizontal', length=self.TL_W,
+                               variable=self.pos, command=self._on_scale, style='Seek.Horizontal.TScale')
+        self.scale.pack(pady=(6, 0))
 
         ctl = ttk.Frame(outer)
         ctl.pack(fill='x', pady=(8, 0))
@@ -1131,6 +1139,7 @@ class PreviewWindow(tk.Toplevel):
             return
         if self.end is not None and self.end > self.duration:
             self.end = None
+        self.scale.configure(to=self.duration)
         self._draw_ticks()
         if src['video']:
             self.pv.itemconfigure(self.pv_text, text='Loading frame…')
@@ -1167,12 +1176,21 @@ class PreviewWindow(tk.Toplevel):
             x1, x2 = self._x(self.start or 0), self._x(self.end if self.end is not None else self.duration)
             self.tl.create_rectangle(x1, 1, x2, self.TL_H - 1, outline=a, width=3, tags='ov')
             self.tl.create_rectangle(x1, self.TL_H - 5, x2, self.TL_H, fill=a, outline='', tags='ov')
+            for xe in (x1, x2):  # grab tabs for dragging the edges
+                self.tl.create_rectangle(xe - 4, self.TL_H // 2 - 12, xe + 4, self.TL_H // 2 + 12,
+                                         fill=a, outline='#ffffff', width=1, tags='ov')
         x = self._x(self.t)
         self.tl.create_line(x, 0, x, self.TL_H, fill='#ffffff', width=3, tags='ov')
         self.tl.create_line(x, 0, x, self.TL_H, fill='#000000', width=1, tags='ov')
+        self.tl.create_polygon(x - 7, 0, x + 7, 0, x, 10, fill='#ffffff', outline='#000000', tags='ov')
 
     def _update_labels(self):
         self.lbl_time.configure(text=fmt_time(self.t))
+        self._syncing = True
+        try:
+            self.pos.set(self.t)
+        finally:
+            self._syncing = False
         if self.start is None and self.end is None:
             self.lbl_sel.configure(text='No section chosen — the whole thing will download')
         else:
@@ -1184,7 +1202,7 @@ class PreviewWindow(tk.Toplevel):
         self._draw_overlay()
 
     # ---- moving around ----
-    def _seek(self, t, now=False):
+    def _seek(self, t, now=False, live=False):
         if not self.duration:
             return
         self.t = max(0.0, min(float(t), max(0.0, self.duration - 0.05)))
@@ -1192,7 +1210,53 @@ class PreviewWindow(tk.Toplevel):
         if self.src and self.src['video']:
             if self._debounce:
                 self.after_cancel(self._debounce)
-            self._debounce = self.after(1 if now else 120, self._fetch_frame)
+                self._debounce = None
+            if live:
+                self._fetch_frame()  # while dragging: keep frames coming, newest position wins
+            else:
+                self._debounce = self.after(1 if now else 120, self._fetch_frame)
+
+    def _edge_xs(self):
+        if not self.duration or (self.start is None and self.end is None):
+            return None
+        return self._x(self.start or 0), self._x(self.end if self.end is not None else self.duration)
+
+    def _edge_at(self, x):
+        xs = self._edge_xs()
+        if not xs:
+            return None
+        ds, de = abs(x - xs[0]), abs(x - xs[1])
+        if min(ds, de) > 7:
+            return None
+        return 'start' if ds <= de else 'end'
+
+    def _tl_hover(self, e):
+        self.tl.configure(cursor='sb_h_double_arrow' if self._edge_at(e.x) else 'hand2')
+
+    def _tl_press(self, e):
+        self._drag = self._edge_at(e.x) or 'play'
+        self._tl_motion(e)
+
+    def _tl_motion(self, e):
+        if not self.duration or not self._drag:
+            return
+        t = max(0.0, min(self.duration, e.x / self.TL_W * self.duration))
+        if self._drag == 'start':
+            end = self.end if self.end is not None else self.duration
+            self.start = min(t, end - 0.1)
+            self._seek(self.start, live=True)
+        elif self._drag == 'end':
+            self.end = max(t, (self.start or 0) + 0.1)
+            self._seek(self.end, live=True)
+        else:
+            self._seek(t, live=True)
+
+    def _tl_release(self, _e):
+        self._drag = None
+
+    def _on_scale(self, value):
+        if not self._syncing:
+            self._seek(float(value), live=True)
 
     def _nudge(self, d):
         self._seek(self.t + d, now=True)
@@ -1603,6 +1667,9 @@ class App(tk.Tk):
                      bordercolor=p['border'], lightcolor=p['surface'], darkcolor=p['surface'],
                      font=('Segoe UI', 9, 'bold'))
         st.map('Treeview.Heading', background=[('active', p['hover'])])
+        st.configure('Seek.Horizontal.TScale', background=p['accent'], troughcolor=p['field'],
+                     bordercolor=p['border'], lightcolor=p['accent'], darkcolor=p['accent'])
+        st.map('Seek.Horizontal.TScale', background=[('active', p['accent_hover'])])
         st.configure('TProgressbar', background=p['accent'], troughcolor=p['field'],
                      bordercolor=p['border'], lightcolor=p['accent'], darkcolor=p['accent'])
         st.configure('TScrollbar', background=p['surface'], troughcolor=p['bg'], bordercolor=p['bg'],
