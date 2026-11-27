@@ -290,6 +290,8 @@ def write_updater_script(src, dst, exe_name, pids, workdir):
         f'{waits}\r\n'
         'ping -n 2 127.0.0.1 >nul\r\n'
         f'robocopy "{src}" "{dst}" /E /R:15 /W:1 /NFL /NDL /NJH /NJS /NP >nul\r\n'
+        # without this the new one-file .exe tries to reuse the old copy's deleted temp folder
+        'set "PYINSTALLER_RESET_ENVIRONMENT=1"\r\n'
         f'start "" "{os.path.join(dst, exe_name)}"\r\n'
         f'rmdir /s /q "{workdir}" >nul 2>&1\r\n'
         '(goto) 2>nul & del "%~f0"\r\n')
@@ -1622,7 +1624,9 @@ class App(tk.Tk):
             pids.append(os.getppid())  # one-file .exe: the launcher process holds the .exe open too
         bat = write_updater_script(new, HERE, os.path.basename(sys.executable), pids, workdir)
         try:
-            subprocess.Popen(['cmd', '/c', bat], close_fds=True,
+            env = {k: v for k, v in os.environ.items() if not k.startswith(('_PYI_', '_MEIPASS'))}
+            env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+            subprocess.Popen(['cmd', '/c', bat], close_fds=True, env=env,
                              creationflags=0x08000000 | 0x00000200)  # no window, own process group
         except Exception as e:
             self._updating = False
