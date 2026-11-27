@@ -4,3 +4,4 @@ App/
 dist/
 __pycache__/
 *.pyc
+_build_info.py

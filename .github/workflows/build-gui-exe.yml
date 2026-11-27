@@ -4,6 +4,9 @@ on:
   push:
     branches: [main, master]
   workflow_dispatch:
+  schedule:
+    # Every Monday ~03:17 Pacific: rebuild with the newest yt-dlp (skipped if nothing changed)
+    - cron: '17 11 * * 1'
 
 permissions:
   contents: write
@@ -21,15 +24,46 @@ jobs:
       - name: Install yt-dlp, dependencies, Deno and PyInstaller
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "yt-dlp[default,deno,curl-cffi]" pyinstaller
+          python -m pip install --upgrade "yt-dlp[default,deno,curl-cffi]" pyinstaller
+
+      - name: Check whether anything changed since the last release
+        id: check
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ver = python -c "import yt_dlp.version as v; print(v.__version__)"
+          "ytdlp=$ver" >> $env:GITHUB_OUTPUT
+          $skip = 'false'
+          if ('${{ github.event_name }}' -eq 'schedule') {
+            $notes = gh release view --json body --jq .body 2>$null
+            if ($notes -match [regex]::Escape("yt-dlp: $ver") -and $notes -match '${{ github.sha }}') {
+              $skip = 'true'
+              Write-Host "yt-dlp $ver and the app code are unchanged since the last release - nothing to do."
+            }
+          }
+          "skip=$skip" >> $env:GITHUB_OUTPUT
+
+      - name: Record build info inside the app
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          @"
+          BUILD = ${{ github.run_number }}
+          BUILT_YTDLP = '${{ steps.check.outputs.ytdlp }}'
+          COMMIT = '${{ github.sha }}'
+          "@ | Set-Content -Encoding utf8 _build_info.py
 
       - name: Build the .exe
+        if: steps.check.outputs.skip != 'true'
         run: >
           python -m PyInstaller --noconfirm --clean --onefile --windowed
           --name "yt-dlp GUI" --distpath App --workpath .build --specpath .build
+          --paths . --hidden-import _build_info
           ytdlp_gui.py
 
       - name: Add Deno and FFmpeg next to the .exe
+        if: steps.check.outputs.skip != 'true'
         shell: pwsh
         run: |
           $prefix = python -c "import sys; print(sys.prefix)"
@@ -41,13 +75,16 @@ jobs:
           Get-ChildItem App
 
       - name: Zip it
+        if: steps.check.outputs.skip != 'true'
         shell: pwsh
         run: Compress-Archive -Path App\* -DestinationPath "yt-dlp-GUI-windows.zip"
 
       - name: Publish as a release
+        if: steps.check.outputs.skip != 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "build-${{ github.run_number }}"
-          gh release create $tag "yt-dlp-GUI-windows.zip" --title "yt-dlp GUI (build ${{ github.run_number }})" --notes "Unzip and run 'yt-dlp GUI.exe'. Keep ffmpeg.exe, ffprobe.exe and deno.exe in the same folder." --latest
+          $n = "${{ github.run_number }}"
+          $notes = "Unzip and run 'yt-dlp GUI.exe' (or use Update now inside the app). Keep ffmpeg.exe, ffprobe.exe and deno.exe in the same folder.`n`nyt-dlp: ${{ steps.check.outputs.ytdlp }}`ncommit: ${{ github.sha }}"
+          gh release create "build-$n" "yt-dlp-GUI-windows.zip" --title "yt-dlp GUI (build $n)" --notes $notes --latest

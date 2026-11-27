@@ -209,7 +209,98 @@ def make_ydl(opts):
 
 
 APP_NAME = 'yt-dlp GUI'
+UPDATE_REPO = 'hawnji/ytdlp-gui'
+UPDATE_ASSET = 'yt-dlp-GUI-windows.zip'
+try:
+    from _build_info import BUILD, BUILT_YTDLP  # written by the GitHub build
+except ImportError:
+    BUILD, BUILT_YTDLP = 0, None
+
+
+def _https_context():
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def fetch_latest_release(timeout=15):
+    """Latest GitHub release of the app: {'build', 'ytdlp', 'url', 'page', 'size'} or None."""
+    import urllib.request
+    req = urllib.request.Request(
+        f'https://api.github.com/repos/{UPDATE_REPO}/releases/latest',
+        headers={'Accept': 'application/vnd.github+json', 'User-Agent': APP_NAME})
+    with urllib.request.urlopen(req, timeout=timeout, context=_https_context()) as r:
+        rel = json.load(r)
+    m = re.fullmatch(r'build-(\d+)', rel.get('tag_name') or '')
+    asset = next((a for a in rel.get('assets') or [] if a.get('name') == UPDATE_ASSET), None)
+    if not m or not asset:
+        return None
+    ver = re.search(r'yt-dlp:\s*(\S+)', rel.get('body') or '')
+    return {'build': int(m.group(1)), 'ytdlp': ver.group(1) if ver else None,
+            'url': asset['browser_download_url'], 'size': asset.get('size') or 0,
+            'page': rel.get('html_url')}
+
+
+def download_update(info, workdir, progress=None, cancel=None):
+    """Download and unpack an update into workdir/new; returns that folder."""
+    import urllib.request
+    import zipfile
+    shutil.rmtree(workdir, ignore_errors=True)
+    os.makedirs(workdir)
+    zpath = os.path.join(workdir, UPDATE_ASSET)
+    req = urllib.request.Request(info['url'], headers={'User-Agent': APP_NAME})
+    with urllib.request.urlopen(req, timeout=60, context=_https_context()) as r, open(zpath, 'wb') as f:
+        total = int(r.headers.get('Content-Length') or info.get('size') or 0)
+        done = 0
+        while True:
+            if cancel and cancel.is_set():
+                raise DownloadCancelled('Update cancelled')
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if progress:
+                progress(done, total)
+    new = os.path.join(workdir, 'new')
+    with zipfile.ZipFile(zpath) as z:
+        z.extractall(new)
+    # the zip holds the app's files at its root (or inside one folder)
+    if not os.path.exists(os.path.join(new, 'yt-dlp GUI.exe')):
+        subs = [os.path.join(new, d) for d in os.listdir(new) if os.path.isdir(os.path.join(new, d))]
+        if len(subs) == 1 and os.path.exists(os.path.join(subs[0], 'yt-dlp GUI.exe')):
+            new = subs[0]
+        else:
+            raise RuntimeError('The update package does not contain yt-dlp GUI.exe')
+    return new
+
+
+def write_updater_script(src, dst, exe_name, pids, workdir):
+    """Batch file that waits for the app to close, copies the new files over it and restarts it."""
+    waits = '\r\n'.join(
+        f':wait{i}\r\ntasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
+        f'if not errorlevel 1 ( ping -n 2 127.0.0.1 >nul & goto wait{i} )'
+        for i, pid in enumerate(pids))
+    script = (
+        '@echo off\r\n'
+        'title Updating yt-dlp GUI...\r\n'
+        f'{waits}\r\n'
+        'ping -n 2 127.0.0.1 >nul\r\n'
+        f'robocopy "{src}" "{dst}" /E /R:15 /W:1 /NFL /NDL /NJH /NJS /NP >nul\r\n'
+        f'start "" "{os.path.join(dst, exe_name)}"\r\n'
+        f'rmdir /s /q "{workdir}" >nul 2>&1\r\n'
+        '(goto) 2>nul & del "%~f0"\r\n')
+    path = os.path.join(os.path.dirname(workdir), 'ytdlp_gui_update.bat')
+    with open(path, 'w', encoding='mbcs' if sys.platform.startswith('win') else 'utf-8') as f:
+        f.write(script)
+    return path
+
+
 SETTINGS_PATH = os.path.join(os.path.expanduser('~'), '.ytdlp_gui.json')
+ARCHIVE_PATH = os.path.join(os.path.expanduser('~'), '.ytdlp_gui_history.txt')
 
 VIDEO_QUALITIES = ['Best', '2160p (4K)', '1440p', '1080p', '720p', '480p', '360p', '240p']
 CONTAINERS = ['mp4', 'mkv', 'webm', 'Any']
@@ -238,6 +329,7 @@ DEFAULTS = {
     'extra_args': '',
     'skip_existing': True,
     'parallel': 3,
+    'only_new': False,
     'dark': True,
 }
 
@@ -390,6 +482,8 @@ def build_args(s):
         args += ['--cookies-from-browser', s['cookies_browser']]
     if s['rate_limit'].strip():
         args += ['-r', s['rate_limit'].strip()]
+    if s.get('only_new'):
+        args += ['--download-archive', ARCHIVE_PATH]
     if not s['skip_existing']:
         args += ['--force-overwrites']
     if s['extra_args'].strip():
@@ -423,14 +517,22 @@ class GuiLogger:
 
 
 class Worker(threading.Thread):
-    def __init__(self, urls, args, q, parallel=1):
+    """Runs downloads. `jobs` is a list of URLs, or of ('url', url, None) / ('entry', entry, extra) tuples
+    (the latter is how failed playlist items are retried with their playlist numbering intact)."""
+
+    def __init__(self, jobs, args, q, parallel=1):
         super().__init__(daemon=True)
-        self.urls, self.args, self.q = urls, args, q
+        self.jobs = [('url', j, None) if isinstance(j, str) else tuple(j) for j in jobs]
+        self.args, self.q = args, q
         self.parallel = max(1, int(parallel or 1))
         self.cancel = threading.Event()
         self.errors = 0
         self._lock = threading.Lock()
         self._tl = threading.local()
+
+    @property
+    def urls(self):
+        return [j[1] for j in self.jobs if j[0] == 'url']
 
     def _on_error(self):
         with self._lock:
@@ -447,6 +549,7 @@ class Worker(threading.Thread):
         self.q.put(('progress', {
             'key': key,
             'title': info.get('title') or os.path.basename(d.get('filename') or ''),
+            'url': info.get('webpage_url') or info.get('original_url'),
             'status': d.get('status'),
             'pct': (done / total * 100) if total else None,
             'size': human_bytes(total),
@@ -464,7 +567,8 @@ class Worker(threading.Thread):
         if d.get('status') == 'started':
             self.q.put(('pp', {'key': key, 'title': info.get('title'), 'pp': d.get('postprocessor')}))
         elif d.get('status') == 'finished' and d.get('postprocessor') == 'MoveFiles':
-            self.q.put(('done_item', {'key': key, 'path': info.get('filepath')}))
+            self.q.put(('done_item', {'key': key, 'path': info.get('filepath'),
+                                      'url': info.get('webpage_url') or info.get('original_url')}))
 
     def _opts(self):
         opts = dict(yt_dlp.parse_options(self.args).ydl_opts)
@@ -475,9 +579,8 @@ class Worker(threading.Thread):
         opts['quiet'] = False
         return opts
 
-    # ---- parallel mode: each thread has its own YoutubeDL; playlists are split into items ----
     def _expand(self, ydl, url):
-        """Return a list of jobs for a URL: either playlist items, or None to process `info` directly."""
+        """Return (entries, info): playlist items as jobs, or info to process directly."""
         info = ydl.extract_info(url, download=False, process=False)
         for _ in range(10):  # follow redirect-style results (short links, channel -> videos tab)
             if not info or info.get('_type') not in ('url', 'url_transparent'):
@@ -499,13 +602,15 @@ class Worker(threading.Thread):
             return None, None  # unusual playlist: let yt-dlp download it in one go
         indices = res.get('requested_entries') or list(range(1, len(entries) + 1))
         common = yt_dlp.YoutubeDL._playlist_infodict(res, n_entries=len(entries))
+        if res.get('playlist_count') and len(entries) < res['playlist_count'] and ydl.params.get('download_archive'):
+            skipped = res['playlist_count'] - len(entries)
+            self.q.put(('log', f'{skipped} item(s) already downloaded earlier — skipping them'))
         jobs = []
         for n, (idx, entry) in enumerate(zip(indices, entries), 1):
-            extra = {**common, 'playlist_index': idx, 'playlist_autonumber': n}
-            jobs.append((dict(entry), extra))
+            jobs.append((dict(entry), {**common, 'playlist_index': idx, 'playlist_autonumber': n}))
         return jobs, None
 
-    def _run_parallel(self, base_opts):
+    def _run_jobs(self, base_opts):
         jobs = queue.Queue()
         stop = threading.Event()
         counts = {'total': 0, 'done': 0}
@@ -520,9 +625,18 @@ class Worker(threading.Thread):
                 counts['done'] += 1
             self.q.put(('overall', dict(counts)))
 
-        for url in self.urls:
-            jobs.put(('url', url, None))
-        add_total(len(self.urls))
+        for job in self.jobs:
+            jobs.put(job)
+        add_total(len(self.jobs))
+
+        def failed(kind, item, extra, info=None):
+            if kind == 'entry':
+                key = item.get('id') or item.get('url')
+                title, url = item.get('title') or item.get('url'), item.get('url')
+            else:
+                key = (info or {}).get('id') or item
+                title, url = (info or {}).get('title') or item, item
+            self.q.put(('item_failed', {'key': key, 'title': title, 'url': url, 'job': (kind, item, extra)}))
 
         def worker():
             try:
@@ -537,6 +651,8 @@ class Worker(threading.Thread):
                         kind, item, extra = jobs.get(timeout=0.2)
                     except queue.Empty:
                         continue
+                    info = None
+                    before = getattr(self._tl, 'errors', 0)
                     try:
                         if self.cancel.is_set():
                             continue
@@ -548,26 +664,21 @@ class Worker(threading.Thread):
                                     ydl.process_ie_result(info, download=True)
                                 else:
                                     ydl.download([item])
-                            else:
-                                if entries:
-                                    pl = entries[0][1].get('playlist') or item
-                                    self.q.put(('log', f'Playlist "{pl}": {len(entries)} items, '
-                                                       f'{self.parallel} at a time'))
+                            elif entries:
+                                pl = entries[0][1].get('playlist') or item
+                                self.q.put(('log', f'Playlist "{pl}": {len(entries)} item(s), '
+                                                   f'{self.parallel} at a time'))
                                 for entry, ex in entries:
                                     if entry.get('id'):
-                                        self.q.put(('queued', {'key': entry['id'],
-                                                               'title': entry.get('title') or entry['url']}))
+                                        self.q.put(('queued', {'key': entry['id'], 'url': entry.get('url'),
+                                                               'title': entry.get('title') or entry.get('url')}))
                                     jobs.put(('entry', entry, ex))
-                                add_total(len(entries))
-                                with self._lock:  # the playlist itself was a placeholder
-                                    counts['total'] -= 1
-                                self.q.put(('overall', dict(counts)))
+                                add_total(len(entries) - 1)  # the playlist itself was a placeholder
                                 continue
                         else:
-                            before = getattr(self._tl, 'errors', 0)
-                            ydl.process_ie_result(item, download=True, extra_info=extra)
-                            if getattr(self._tl, 'errors', 0) > before and item.get('id'):
-                                self.q.put(('item_error', {'key': item['id']}))
+                            ydl.process_ie_result(dict(item), download=True, extra_info=extra)
+                        if getattr(self._tl, 'errors', 0) > before:
+                            failed(kind, item, extra, info)
                         finish_one()
                     except DownloadCancelled:
                         self.cancel.set()
@@ -575,9 +686,8 @@ class Worker(threading.Thread):
                         if not str(e).startswith('ERROR'):  # yt-dlp errors were already logged
                             self._on_error()
                             self.q.put(('log', f'ERROR: {e}'))
-                        key = item.get('id') if isinstance(item, dict) else None
-                        if key:
-                            self.q.put(('item_error', {'key': key}))
+                        if not self.cancel.is_set():
+                            failed(kind, item, extra, info)
                         finish_one()
                     finally:
                         jobs.task_done()
@@ -593,29 +703,11 @@ class Worker(threading.Thread):
             t.join()
 
     def run(self):
-        ok = True
         try:
-            opts = self._opts()
-            if self.parallel > 1:
-                self._run_parallel(opts)
-                if self.cancel.is_set():
-                    raise DownloadCancelled('Cancelled by user')
-                self.q.put(('finished', self.errors == 0))
-                return
-            with make_ydl(opts) as ydl:
-                for url in self.urls:
-                    if self.cancel.is_set():
-                        break
-                    self.q.put(('log', f'=== {url}'))
-                    try:
-                        ret = ydl.download([url])
-                        if ret:
-                            ok = False
-                    except DownloadCancelled:
-                        raise
-                    except Exception as e:
-                        ok = False
-                        self.q.put(('log', f'ERROR: {e}'))
+            self._run_jobs(self._opts())
+            if self.cancel.is_set():
+                raise DownloadCancelled('Cancelled by user')
+            ok = self.errors == 0
         except DownloadCancelled:
             self.q.put(('log', 'Download cancelled.'))
             ok = None
@@ -871,7 +963,8 @@ class ArgPicker(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f'{APP_NAME}  —  yt-dlp {YTDLP_VERSION}')
+        self.title(f'{APP_NAME}' + (f'  (build {BUILD})' if BUILD else '') + f'  —  yt-dlp {YTDLP_VERSION}')
+        self._updating = False
         self.geometry('980x720')
         self.minsize(820, 600)
         self.q = queue.Queue()
@@ -886,6 +979,7 @@ class App(tk.Tk):
         self._apply_theme()
         self._on_mode()
         self.after(100, self._poll)
+        self.after(2000, lambda: self._check_updates(quiet=True))
         self.protocol('WM_DELETE_WINDOW', self._on_close)
         if not shutil.which('ffmpeg'):
             self._log('WARNING: FFmpeg was not found on PATH. Merging best video+audio, '
@@ -1016,7 +1110,9 @@ class App(tk.Tk):
         root.pack(fill='both', expand=True)
 
         # URLs
+        self.banner = tk.Frame(root)  # 'update available' strip, shown when needed
         top = ttk.LabelFrame(root, text='URLs (one per line — videos, playlists or channels)', padding=8)
+        self._first_section = top
         top.pack(fill='x')
         self.url_text = tk.Text(top, height=4, wrap='none', font=('Consolas', 10), undo=True)
         self.url_text.grid(row=0, column=0, rowspan=3, sticky='nsew')
@@ -1099,6 +1195,12 @@ class App(tk.Tk):
         ttk.Label(ext, text='Simultaneous downloads').grid(row=6, column=0, sticky='w', pady=(2, 0))
         ttk.Spinbox(ext, from_=1, to=10, textvariable=self.parallel, width=6, state='readonly',
                     wrap=False).grid(row=6, column=1, sticky='w', pady=(2, 0))
+        self.only_new = tk.BooleanVar()
+        nf = ttk.Frame(ext)
+        nf.grid(row=7, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        ttk.Checkbutton(nf, text='Only download new items (remember what I already have)',
+                        variable=self.only_new).pack(side='left')
+        ttk.Button(nf, text='Forget…', width=8, command=self._forget_history).pack(side='left', padx=(6, 0))
 
         # -- Output
         out = ttk.LabelFrame(root, text='Output', padding=8)
@@ -1132,8 +1234,11 @@ class App(tk.Tk):
         self.btn_cancel = ttk.Button(bar, text='Cancel', command=self._cancel, state='disabled')
         self.btn_cancel.pack(side='left', padx=6)
         ttk.Button(bar, text='Clear list', command=self._clear_list).pack(side='left')
+        self.btn_retry = ttk.Button(bar, text='↻  Retry failed', command=self._retry_failed, state='disabled')
+        self.btn_retry.pack(side='left', padx=6)
         self.dark = tk.BooleanVar()
         ttk.Checkbutton(bar, text='Dark mode', variable=self.dark, command=self._toggle_theme).pack(side='right')
+        ttk.Button(bar, text='Updates', command=lambda: self._check_updates(quiet=False)).pack(side='right', padx=(0, 10))
         self.status = tk.StringVar(value='Ready')
         ttk.Label(bar, textvariable=self.status).pack(side='right', padx=(0, 16))
 
@@ -1155,7 +1260,11 @@ class App(tk.Tk):
         self.tree.tag_configure('done', foreground='#1a7f37')
         self.tree.tag_configure('err', foreground='#cf222e')
         self.tree.bind('<Double-1>', self._open_row)
-        self.row_paths = {}
+        self.tree.bind('<Button-3>', self._row_menu)
+        self.tree.bind('<Button-2>' if sys.platform == 'darwin' else '<Control-Button-1>', self._row_menu)
+        self.row_paths = {}   # iid -> downloaded file
+        self.row_urls = {}    # iid -> page link
+        self.row_jobs = {}    # iid -> job to re-run if it failed
         pane.add(tf, weight=3)
 
         lf = ttk.Frame(pane)
@@ -1260,10 +1369,13 @@ class App(tk.Tk):
         t.pack(fill='both', expand=True, padx=8, pady=8)
         ttk.Button(win, text='Copy', command=lambda: (self.clipboard_clear(), self.clipboard_append(cmd))).pack(pady=(0, 8))
 
-    def _start(self):
-        if self.worker and self.worker.is_alive():
+    def _busy(self):
+        return bool(self.worker and self.worker.is_alive())
+
+    def _start(self, jobs=None):
+        if self._busy() or self._updating:
             return
-        urls = self._urls()
+        urls = jobs or self._urls()
         if not urls:
             messagebox.showinfo(APP_NAME, 'Paste at least one URL first.')
             return
@@ -1281,13 +1393,14 @@ class App(tk.Tk):
         self.progress['value'] = 0
         self.btn_go.configure(state='disabled')
         self.btn_cancel.configure(state='normal')
-        self.status.set(f'Downloading {len(urls)} link(s)…')
+        self.btn_retry.configure(state='disabled')
+        self.status.set(f'Retrying {len(urls)} item(s)…' if jobs else f'Downloading {len(urls)} link(s)…')
         self._started = time.time()
         try:
             n = max(1, min(10, int(self.parallel.get())))
         except (tk.TclError, ValueError):
             n = 1
-        self.parallel_on = n > 1
+        self._overall_total = 0
         self.worker = Worker(urls, args, self.q, parallel=n)
         self.worker.start()
 
@@ -1297,21 +1410,114 @@ class App(tk.Tk):
             self.status.set('Cancelling…')
 
     def _clear_list(self):
-        if self.worker and self.worker.is_alive():
+        if self._busy():
             return
         self.tree.delete(*self.tree.get_children())
         self.rows.clear()
         self.row_paths.clear()
+        self.row_urls.clear()
+        self.row_jobs.clear()
+        self.btn_retry.configure(state='disabled')
+
+    def _retry(self, iids):
+        iids = [i for i in iids if i in self.row_jobs]
+        if not iids or self._busy():
+            return
+        jobs = []
+        for iid in iids:
+            jobs.append(self.row_jobs.pop(iid))
+            self.tree.set(iid, 'status', 'Queued')
+            for col in ('progress', 'speed', 'eta'):
+                self.tree.set(iid, col, '')
+            self.tree.item(iid, tags=())
+        self._start(jobs)
+
+    def _forget_history(self):
+        try:
+            with open(ARCHIVE_PATH, encoding='utf-8') as f:
+                n = sum(1 for line in f if line.strip())
+        except OSError:
+            n = 0
+        if not n:
+            messagebox.showinfo(APP_NAME, 'The download history is already empty.', parent=self)
+            return
+        if messagebox.askyesno(APP_NAME, f'The app remembers {n} downloaded item(s).\n\n'
+                               'Forget them all? Next time, everything will be downloaded again '
+                               '(files already in the folder are still skipped).', parent=self):
+            try:
+                os.remove(ARCHIVE_PATH)
+                self._log(f'Download history cleared ({n} items).')
+            except OSError as e:
+                messagebox.showerror(APP_NAME, f'Could not clear the history:\n{e}', parent=self)
+
+    def _retry_failed(self):
+        self._retry(list(self.row_jobs))
+
+    def _remove_rows(self, iids):
+        busy = self._busy()
+        for iid in iids:
+            st = self.tree.set(iid, 'status')
+            if busy and st not in ('✔ Done', 'Error', 'Skipped', 'Cancelled'):
+                continue  # don't remove items that are still being worked on
+            self.tree.delete(iid)
+            for d in (self.row_paths, self.row_urls, self.row_jobs):
+                d.pop(iid, None)
+            for k, v in list(self.rows.items()):
+                if v == iid:
+                    del self.rows[k]
+        self.btn_retry.configure(state='normal' if self.row_jobs and not busy else 'disabled')
+
+    def _show_in_folder(self, path):
+        if sys.platform.startswith('win'):
+            subprocess.Popen(['explorer', '/select,', os.path.normpath(path)])
+        else:
+            open_path(os.path.dirname(path))
+
+    def _copy(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    def _row_menu(self, e):
+        iid = self.tree.identify_row(e.y)
+        if not iid:
+            return
+        sel = self.tree.selection()
+        if iid not in sel:
+            self.tree.selection_set(iid)
+            sel = (iid,)
+        p = self.palette
+        m = tk.Menu(self, tearoff=0, background=p['surface'], foreground=p['fg'],
+                    activebackground=p['accent'], activeforeground=p['on_accent'],
+                    disabledforeground=p['disabled'], borderwidth=1, relief='flat')
+        path = self.row_paths.get(iid)
+        has_file = bool(path and os.path.exists(path))
+        urls = [self.row_urls[i] for i in sel if self.row_urls.get(i)]
+        failed = [i for i in sel if i in self.row_jobs]
+        many = len(sel) > 1
+        m.add_command(label='Open file', command=lambda: open_path(path),
+                      state='normal' if has_file and not many else 'disabled')
+        m.add_command(label='Show in folder', command=lambda: self._show_in_folder(path),
+                      state='normal' if has_file and not many else 'disabled')
+        m.add_separator()
+        m.add_command(label='Open link in browser', command=lambda: __import__('webbrowser').open(urls[0]),
+                      state='normal' if urls and not many else 'disabled')
+        m.add_command(label='Copy links' if len(urls) > 1 else 'Copy link',
+                      command=lambda: self._copy('\n'.join(urls)), state='normal' if urls else 'disabled')
+        m.add_separator()
+        m.add_command(label=f'Retry ({len(failed)})' if many else 'Retry', command=lambda: self._retry(failed),
+                      state='normal' if failed and not self._busy() else 'disabled')
+        m.add_command(label='Remove from list', command=lambda: self._remove_rows(sel))
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
 
     def _open_row(self, _e):
         sel = self.tree.selection()
         if sel and sel[0] in self.row_paths:
             p = self.row_paths[sel[0]]
             if p and os.path.exists(p):
-                if sys.platform.startswith('win'):
-                    subprocess.Popen(['explorer', '/select,', os.path.normpath(p)])
-                else:
-                    open_path(os.path.dirname(p))
+                self._show_in_folder(p)
 
     def _on_close(self):
         self._save_settings()
@@ -1319,6 +1525,109 @@ class App(tk.Tk):
             if not messagebox.askyesno(APP_NAME, 'A download is running. Cancel it and quit?'):
                 return
             self.worker.cancel.set()
+        self.destroy()
+
+    # ---------- updates ----------
+    def _check_updates(self, quiet=True):
+        if not FROZEN or not BUILD:
+            if not quiet:
+                messagebox.showinfo(APP_NAME, 'Automatic updates work in the downloaded .exe version.\n'
+                                              'You are running the app from source.', parent=self)
+            return
+        if not quiet:
+            self.status.set('Checking for updates…')
+
+        def work():
+            try:
+                info = fetch_latest_release()
+            except Exception as e:
+                info = e
+            self.q.put(('update_check', {'info': info, 'quiet': quiet}))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_check(self, info, quiet):
+        if isinstance(info, Exception):
+            if not quiet:
+                self.status.set('Ready')
+                messagebox.showerror(APP_NAME, f'Could not check for updates:\n{info}', parent=self)
+            return
+        if info and info['build'] > BUILD:
+            self._show_update_banner(info)
+        elif not quiet:
+            self.status.set('Ready')
+            messagebox.showinfo(APP_NAME, f'You have the latest version (build {BUILD}, yt-dlp {YTDLP_VERSION}).',
+                                parent=self)
+
+    def _show_update_banner(self, info):
+        p = self.palette
+        b = self.banner
+        for w in b.winfo_children():
+            w.destroy()
+        b.configure(bg=p['accent'])
+        text = f"A new version is available — build {info['build']}"
+        if info.get('ytdlp') and info['ytdlp'] != YTDLP_VERSION:
+            text += f"  (yt-dlp {YTDLP_VERSION} → {info['ytdlp']})"
+        tk.Label(b, text=text, bg=p['accent'], fg=p['on_accent'],
+                 font=('Segoe UI', 10, 'bold')).pack(side='left', padx=10, pady=6)
+        mk = dict(bg=p['on_accent'], fg=p['accent'], activebackground=p['bg'], activeforeground=p['fg'],
+                  relief='flat', borderwidth=0, padx=10, pady=2, font=('Segoe UI', 9, 'bold'), cursor='hand2')
+        tk.Button(b, text='Later', command=b.pack_forget, **mk).pack(side='right', padx=(4, 8))
+        if info.get('page'):
+            tk.Button(b, text="What's new", command=lambda: __import__('webbrowser').open(info['page']),
+                      **mk).pack(side='right', padx=4)
+        tk.Button(b, text='Update now', command=lambda: self._install_update(info), **mk).pack(side='right', padx=4)
+        b.pack(fill='x', before=self._first_section, pady=(0, 8))
+
+    def _install_update(self, info):
+        if self._busy():
+            messagebox.showinfo(APP_NAME, 'Let the current downloads finish (or cancel them) before updating.',
+                                parent=self)
+            return
+        try:
+            probe = os.path.join(HERE, '.write_test')
+            with open(probe, 'w'):
+                pass
+            os.remove(probe)
+        except OSError:
+            if messagebox.askyesno(APP_NAME, "The app's folder can't be written to, so it can't update itself.\n\n"
+                                   'Open the download page instead?', parent=self) and info.get('page'):
+                __import__('webbrowser').open(info['page'])
+            return
+        size = human_bytes(info.get('size')) or 'about 200 MB'
+        if not messagebox.askyesno(APP_NAME, f"Download build {info['build']} ({size}) and restart the app?",
+                                   parent=self):
+            return
+        import tempfile
+        workdir = os.path.join(tempfile.gettempdir(), 'ytdlp_gui_update')
+        self._updating = True
+        self.btn_go.configure(state='disabled')
+        self.banner.pack_forget()
+        self.status.set('Downloading update…')
+
+        def work():
+            try:
+                new = download_update(info, workdir,
+                                      progress=lambda d, t: self.q.put(('update_progress', (d, t))))
+                self.q.put(('update_ready', {'new': new, 'workdir': workdir}))
+            except Exception as e:
+                self.q.put(('update_failed', str(e)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_update(self, new, workdir):
+        pids = [os.getpid()]
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass and os.path.normcase(meipass) != os.path.normcase(HERE):
+            pids.append(os.getppid())  # one-file .exe: the launcher process holds the .exe open too
+        bat = write_updater_script(new, HERE, os.path.basename(sys.executable), pids, workdir)
+        try:
+            subprocess.Popen(['cmd', '/c', bat], close_fds=True,
+                             creationflags=0x08000000 | 0x00000200)  # no window, own process group
+        except Exception as e:
+            self._updating = False
+            self.btn_go.configure(state='normal')
+            messagebox.showerror(APP_NAME, f'Could not start the updater:\n{e}', parent=self)
+            return
+        self._save_settings()
         self.destroy()
 
     # ---------- queue pump ----------
@@ -1348,16 +1657,26 @@ class App(tk.Tk):
                 elif kind == 'queued':
                     iid = self._row(data['key'], data['title'])
                     self.tree.set(iid, 'status', 'Queued')
-                elif kind == 'item_error':
-                    iid = self._row(data['key'])
+                    if data.get('url'):
+                        self.row_urls.setdefault(iid, data['url'])
+                elif kind == 'item_failed':
+                    iid = self._row(data['key'], data['title'])
                     self.tree.set(iid, 'status', 'Error')
+                    self.tree.set(iid, 'speed', '')
+                    self.tree.set(iid, 'eta', '')
                     self.tree.item(iid, tags=('err',))
+                    self.row_jobs[iid] = data['job']
+                    if data.get('url'):
+                        self.row_urls.setdefault(iid, data['url'])
                 elif kind == 'overall':
-                    if data['total']:
-                        self.progress['value'] = data['done'] / data['total'] * 100
+                    self._overall_total = data['total']
+                    if data['total'] > 1 or data['done']:
+                        self.progress['value'] = data['done'] / max(1, data['total']) * 100
                         self.status.set(f"Downloading… {data['done']} of {data['total']} done")
                 elif kind == 'progress':
                     iid = self._row(data['key'], data['title'])
+                    if data.get('url'):
+                        self.row_urls[iid] = data['url']
                     st = data['status']
                     if st == 'downloading':
                         pct = data['pct']
@@ -1369,7 +1688,7 @@ class App(tk.Tk):
                         self.tree.set(iid, 'speed', data['speed'])
                         self.tree.set(iid, 'eta', data['eta'])
                         self.tree.set(iid, 'status', 'Downloading')
-                        if pct is not None and not self.parallel_on:
+                        if pct is not None and self._overall_total <= 1:
                             self.progress['value'] = pct
                     elif st == 'finished':
                         self.tree.set(iid, 'progress', '100%')
@@ -1390,15 +1709,38 @@ class App(tk.Tk):
                     self.tree.set(iid, 'progress', '100%')
                     self.tree.item(iid, tags=('done',))
                     self.row_paths[iid] = data['path']
+                    self.row_jobs.pop(iid, None)
+                    if data.get('url'):
+                        self.row_urls[iid] = data['url']
+                elif kind == 'update_check':
+                    self._on_update_check(data['info'], data['quiet'])
+                elif kind == 'update_progress':
+                    d, t = data
+                    if t:
+                        self.progress['value'] = d / t * 100
+                    self.status.set(f'Downloading update… {human_bytes(d)}' + (f' of {human_bytes(t)}' if t else ''))
+                elif kind == 'update_ready':
+                    self.status.set('Installing update — the app will restart…')
+                    self._finish_update(data['new'], data['workdir'])
+                    return
+                elif kind == 'update_failed':
+                    self._updating = False
+                    self.btn_go.configure(state='normal')
+                    self.progress['value'] = 0
+                    self.status.set('Update failed')
+                    messagebox.showerror(APP_NAME, f'The update could not be downloaded:\n{data}', parent=self)
                 elif kind == 'finished':
                     self.btn_go.configure(state='normal')
                     self.btn_cancel.configure(state='disabled')
+                    self.btn_retry.configure(state='normal' if self.row_jobs else 'disabled')
                     secs = int(time.time() - getattr(self, '_started', time.time()))
                     if data is None:
                         self.status.set('Cancelled')
                     elif data:
                         self.status.set(f'Finished in {human_eta(secs)}')
                         self.progress['value'] = 100
+                    elif self.row_jobs:
+                        self.status.set(f'Finished — {len(self.row_jobs)} failed (right-click or Retry failed)')
                     else:
                         self.status.set('Finished with errors — see log')
                     for key, iid in self.rows.items():
