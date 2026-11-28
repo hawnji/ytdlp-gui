@@ -92,20 +92,16 @@ jobs:
           Get-ChildItem ff -Recurse -Include ffmpeg.exe,ffprobe.exe | Copy-Item -Destination App\
           Get-ChildItem App
 
-      - name: Keep the old app name working for existing installs
-        if: steps.check.outputs.skip != 'true'
-        shell: pwsh
-        # Installs from before the rename update and restart "yt-dlp GUI.exe"; this copy of the new app
-        # simply opens Grabbit.exe, so old shortcuts and old updaters keep working.
-        run: Copy-Item App\Grabbit.exe "App\yt-dlp GUI.exe"
-
       - name: Zip it
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
         run: |
           Compress-Archive -Path App\* -DestinationPath "Grabbit-windows.zip"
-          # same package under the old name, which app versions from before the rename look for
-          Copy-Item "Grabbit-windows.zip" "yt-dlp-GUI-windows.zip"
+          # Package under the old name, for app versions from before the rename. Those updaters restart
+          # "yt-dlp GUI.exe", so this one also carries a copy under that name, which simply opens Grabbit.exe
+          # (and Grabbit then deletes it). Current versions download Grabbit-windows.zip, without the copy.
+          Copy-Item App\Grabbit.exe "App\yt-dlp GUI.exe"
+          Compress-Archive -Path App\* -DestinationPath "yt-dlp-GUI-windows.zip"
 
       - name: Add patch notes to older releases that don't have any
         if: steps.check.outputs.skip != 'true'

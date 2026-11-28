@@ -15,8 +15,8 @@ TRAILERS = ('co-authored-by:', 'claude-session:', 'signed-off-by:')
 APP_FILES = ('ytdlp_gui.py', 'ytdlp_gui.pyw', 'build_exe.bat', 'assets', '.github/workflows/build-gui-exe.yml')
 FOOTER = ('Update with **Update now** inside the app, or download **Grabbit-windows.zip** below, unblock it '
           '(right-click → Properties → Unblock), unzip it and run Grabbit.exe. Keep ffmpeg.exe, ffprobe.exe and '
-          'deno.exe next to it. (yt-dlp-GUI-windows.zip is the same package under the old name, for older '
-          'installs to update from.)')
+          'deno.exe next to it. (yt-dlp-GUI-windows.zip is only for versions from before the rename '
+          'to update from — you don\'t need it.)')
 
 
 def git(*args):

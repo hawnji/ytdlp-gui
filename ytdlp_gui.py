@@ -3202,6 +3202,7 @@ class App(tk.Tk):
         self._update_example()
         self.after(100, self._poll)
         self.after(2000, lambda: self._check_updates(quiet=True))
+        self.after(8000, remove_old_name_copy)
         self._clip_last = self._read_clipboard()
         self.after(700, self._poll_clipboard)
         self._enable_drag_and_drop()
@@ -4477,6 +4478,20 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._poll)
+
+
+def remove_old_name_copy():
+    """Delete the leftover 'yt-dlp GUI.exe' next to Grabbit.exe (it only existed to hand old installs over)."""
+    if not FROZEN or os.path.basename(sys.executable).lower() != EXE_NAME.lower():
+        return False
+    old = os.path.join(HERE, LEGACY_EXE)
+    try:
+        if os.path.isfile(old):
+            os.remove(old)
+            return True
+    except OSError:
+        pass  # still running (it is handing over right now) — try again next time
+    return False
 
 
 def _hand_over_to_new_name():
