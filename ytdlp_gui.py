@@ -4137,7 +4137,7 @@ class App(tk.Tk):
         self._set_icon()
         self._updating = False
         self.geometry('980x720')
-        self.minsize(820, 600)
+        self.minsize(820, 420)
         self.q = queue.Queue()
         self.worker = None
         self.rows = {}
@@ -4159,6 +4159,7 @@ class App(tk.Tk):
                   self.suno_id, self.clip_start, self.clip_end):
             v.trace_add('write', lambda *_: self._schedule_example())
         self._update_example()
+        self._fit_window()
         self.after(100, self._poll)
         self.after(2000, lambda: self._check_updates(quiet=True))
         self.after(8000, remove_old_name_copy)
@@ -4268,6 +4269,8 @@ class App(tk.Tk):
         st.configure('Sash', sashthickness=6, gripcount=0, background=p['bg'])
 
         self.configure(bg=p['bg'])
+        if getattr(self, '_canvas', None) is not None:
+            self._canvas.configure(background=p['bg'])
         # Combobox drop-down lists are plain Tk listboxes
         for opt, val in (('background', p['field']), ('foreground', p['fg']),
                          ('selectBackground', p['accent']), ('selectForeground', p['on_accent'])):
@@ -4290,6 +4293,60 @@ class App(tk.Tk):
         self.tree.tag_configure('skip', foreground=p['muted'])
         self.tree.tag_configure('err', foreground=p['err'])
         self._set_titlebar(self)
+
+    def _relayout(self):
+        """Fit the content to the window: stretch it when there's room, scroll it when there isn't."""
+        c = self._canvas
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 50 or h < 50:
+            return
+        need = self._root_frame.winfo_reqheight()
+        height = max(h, need)
+        c.itemconfigure(self._canvas_win, width=w, height=height)
+        c.configure(scrollregion=(0, 0, w, height))
+        want = need > h + 1
+        if want != self._vsb_shown:
+            self._vsb_shown = want
+            if want:
+                self._vsb.pack(side='right', fill='y', before=c)
+            else:
+                self._vsb.pack_forget()
+                c.yview_moveto(0)
+
+    def _on_wheel(self, e):
+        """Mouse wheel scrolls the main window — unless the pointer is over something that scrolls itself."""
+        if not self._vsb_shown:
+            return
+        w = e.widget
+        try:
+            if not isinstance(w, tk.Misc) or w.winfo_toplevel() is not self:
+                return
+            if w.winfo_class() in ('Treeview', 'Text', 'Listbox', 'TCombobox', 'TScale', 'Scale', 'TSpinbox'):
+                return
+        except (tk.TclError, KeyError, AttributeError):
+            return
+        self._canvas.yview_scroll(-1 if e.delta > 0 else 1, 'units')
+
+    def _fit_window(self):
+        """Open at the last size used, or else big enough to show everything (as far as the screen allows)."""
+        self.update_idletasks()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        geo = self.settings.get('_window') or ''
+        m = re.match(r'^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$', geo)
+        if m:
+            w, h, x, y = map(int, m.groups())
+            if 400 <= w <= sw + 20 and 300 <= h <= sh + 20 and -50 <= x < sw - 100 and -10 <= y < sh - 100:
+                self.geometry(geo)
+                if self.settings.get('_zoomed'):
+                    try:
+                        self.state('zoomed')
+                    except tk.TclError:
+                        pass
+                return
+        need_w = max(980, self._root_frame.winfo_reqwidth() + 20)
+        need_h = max(720, self._root_frame.winfo_reqheight() + 4)
+        w, h = min(need_w, sw - 40), min(need_h, sh - 90)  # leave room for the taskbar and title bar
+        self.geometry(f'{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h - 60) // 2)}')
 
     def _all_widgets(self, root, cls):
         out = []
@@ -4324,8 +4381,20 @@ class App(tk.Tk):
     # ---------- layout ----------
     def _build(self):
         pad = {'padx': 8, 'pady': 4}
-        root = ttk.Frame(self, padding=10)
-        root.pack(fill='both', expand=True)
+        # Everything sits on a canvas, so when the window is too short for it all a scrollbar appears
+        # (instead of the bottom being cut off). When there is room, the download list just gets taller.
+        holder = ttk.Frame(self)
+        holder.pack(fill='both', expand=True)
+        self._canvas = tk.Canvas(holder, highlightthickness=0, borderwidth=0, background=self.palette['bg'])
+        self._vsb = ttk.Scrollbar(holder, orient='vertical', command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._vsb.set)
+        self._canvas.pack(side='left', fill='both', expand=True)
+        self._vsb_shown = False
+        root = ttk.Frame(self._canvas, padding=10)
+        self._root_frame = root
+        self._canvas_win = self._canvas.create_window(0, 0, window=root, anchor='nw')
+        self._canvas.bind('<Configure>', lambda e: self._relayout())
+        self.bind_all('<MouseWheel>', self._on_wheel, add='+')
 
         # URLs
         self.banner = tk.Frame(root)  # 'update available' strip, shown when needed
@@ -4549,7 +4618,7 @@ class App(tk.Tk):
 
         tf = ttk.Frame(pane)
         cols = ('title', 'progress', 'size', 'speed', 'eta', 'status')
-        self.tree = ttk.Treeview(tf, columns=cols, show='headings', height=7)
+        self.tree = ttk.Treeview(tf, columns=cols, show='headings', height=6)
         for c, w, anchor in (('title', 420, 'w'), ('progress', 80, 'e'), ('size', 90, 'e'),
                              ('speed', 100, 'e'), ('eta', 60, 'e'), ('status', 150, 'w')):
             self.tree.heading(c, text=c.capitalize() if c != 'eta' else 'ETA')
@@ -4578,7 +4647,7 @@ class App(tk.Tk):
         lf = ttk.Frame(pane)
         self.progress = ttk.Progressbar(lf, mode='determinate', maximum=100)
         self.progress.pack(fill='x', pady=(4, 4))
-        self.log = tk.Text(lf, height=8, wrap='word', font=('Consolas', 9), state='disabled',
+        self.log = tk.Text(lf, height=5, wrap='word', font=('Consolas', 9), state='disabled',
                            background='#1e1e1e', foreground='#d4d4d4', insertbackground='white')
         ls = ttk.Scrollbar(lf, orient='vertical', command=self.log.yview)
         self.log.configure(yscrollcommand=ls.set)
@@ -4601,6 +4670,7 @@ class App(tk.Tk):
             self.settings.update({k: v for k, v in data.items() if k in DEFAULTS})
             self._col_widths = data.get('col_widths') or {}
             self.settings.update({k: v for k, v in (data.get('convert') or {}).items() if k.startswith('convert_')})
+            self.settings['_window'], self.settings['_zoomed'] = data.get('window'), data.get('zoomed')
         except Exception:
             pass
         if not self.settings.get('outdir_audio'):
@@ -4642,6 +4712,15 @@ class App(tk.Tk):
             except Exception:
                 pass
             data['convert'] = {k: v for k, v in self.settings.items() if k.startswith('convert_')}
+            try:  # window size and place, so it opens the same way next time
+                state = self.state()
+                if state == 'normal':
+                    self.settings['_window'], self.settings['_zoomed'] = self.geometry(), False
+                elif state == 'zoomed':
+                    self.settings['_zoomed'] = True
+            except Exception:
+                pass
+            data['window'], data['zoomed'] = self.settings.get('_window'), bool(self.settings.get('_zoomed'))
             with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
         except Exception:
@@ -5297,6 +5376,7 @@ class App(tk.Tk):
                       **mk).pack(side='right', padx=4)
         tk.Button(b, text='Update now', command=lambda: self._install_update(info), **mk).pack(side='right', padx=4)
         b.pack(fill='x', before=self._first_section, pady=(0, 8))
+        self.after_idle(self._relayout)
 
     def _install_update(self, info):
         if self._busy():
@@ -5542,6 +5622,13 @@ class App(tk.Tk):
                                 self.tree.set(iid, 'status', '✔ Done')
                                 self.tree.item(iid, tags=('done',))
         except queue.Empty:
+            pass
+        try:  # parts of the window can appear/disappear (update banner, options): keep the fit right
+            need = self._root_frame.winfo_reqheight()
+            if need != getattr(self, '_last_need', None):
+                self._last_need = need
+                self._relayout()
+        except tk.TclError:
             pass
         self.after(100, self._poll)
 
