@@ -126,9 +126,10 @@ class SunoIE(InfoExtractor):
 
 
 class SunoPlaylistIE(InfoExtractor):
-    """Suno playlists: suno.com/playlist/<id> — each song is handed to SunoIE."""
+    """Suno playlists and albums: suno.com/playlist/<id>, suno.com/album/<id> (albums are playlists on Suno's
+    side) — each song is handed to SunoIE."""
     IE_NAME = 'suno:playlist'
-    _VALID_URL = r'https?://(?:www\.|app\.)?suno\.com/playlist/(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+    _VALID_URL = r'https?://(?:www\.|app\.)?suno\.com/(?P<kind>playlist|album)/(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
     _API = 'https://studio-api.prod.suno.com/api/playlist/'
 
     def _real_extract(self, url):
@@ -150,15 +151,16 @@ class SunoPlaylistIE(InfoExtractor):
             total = data.get('num_total_results')
             if not new or (total and len(entries) >= total):
                 break
+        kind = self._match_valid_url(url).group('kind')
         if not entries:
-            raise ExtractorError('This Suno playlist is empty, private or deleted', expected=True)
+            raise ExtractorError(f'This Suno {kind} is empty, private or deleted', expected=True)
         handle = info.get('user_handle')
         return self.playlist_result(
             entries, playlist_id, info.get('name'), info.get('description') or None,
             thumbnail=url_or_none(info.get('image_url')),
             uploader=info.get('user_display_name') or handle, uploader_id=handle,
             uploader_url=f'https://suno.com/@{handle}' if handle else None,
-            webpage_url=f'https://suno.com/playlist/{playlist_id}')
+            webpage_url=f'https://suno.com/{kind}/{playlist_id}')
 
 
 class SunoProfileIE(InfoExtractor):
