@@ -2872,8 +2872,9 @@ class SearchWindow(tk.Toplevel):
         self.tree.tag_configure('checked', background=p['select'])
         self.tree.tag_configure('added', foreground=p['muted'])
         self.checked, self.added, self._anchor = set(), set(), None
+        self._sort = (None, False)  # (column, descending); None = the site's own order
         for c, w, a in (('title', 420, 'w'), ('channel', 180, 'w'), ('length', 70, 'e'), ('views', 70, 'e')):
-            self.tree.heading(c, text=c.capitalize())
+            self.tree.heading(c, text=c.capitalize(), command=lambda c=c: self._sort_by(c))
             self.tree.column(c, width=w, anchor=a, stretch=(c == 'title'))
         sb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
@@ -2938,6 +2939,8 @@ class SearchWindow(tk.Toplevel):
                     self.status.set(f'{shown} result{"s" if shown != 1 else ""}' if shown else 'No results.')
                     can_more = shown >= self.n and self.n < self.MAX
                     self.btn_more.configure(state='normal' if can_more else 'disabled')
+                    if new and self._sort[0]:
+                        self._apply_sort()  # keep "Load more" results in the chosen order
                     self._update_count()
                 elif kind == 'thumb':
                     iid, png = data
@@ -2959,6 +2962,44 @@ class SearchWindow(tk.Toplevel):
 
     def _selected(self):
         return [self.results[int(i)] for i in sorted(self.checked, key=int)]
+
+    _SORT_KEYS = {
+        'title': lambda r: (r['title'] or '').casefold(),
+        'channel': lambda r: (r['channel'] or '').casefold(),
+        'length': lambda r: r['duration'] or 0,
+        'views': lambda r: r['views'] or 0,
+    }
+
+    def _sort_by(self, col):
+        """Click a heading: sort by it; click again to flip; a third time goes back to the site's order.
+        Numbers start biggest-first (most views, longest), text starts A→Z."""
+        cur, desc = self._sort
+        first_desc = col in ('length', 'views')
+        if cur != col:
+            self._sort = (col, first_desc)
+        elif desc == first_desc:
+            self._sort = (col, not desc)
+        else:
+            self._sort = (None, False)
+        self._apply_sort()
+
+    def _apply_sort(self):
+        col, desc = self._sort
+        rows = list(self.tree.get_children())
+        if col:
+            key = self._SORT_KEYS[col]
+            # results without a value (no view count etc.) always go last
+            have = [i for i in rows if key(self.results[int(i)]) not in ('', 0)]
+            missing = sorted((i for i in rows if i not in set(have)), key=int)
+            rows = sorted(sorted(have, key=int), key=lambda i: key(self.results[int(i)]), reverse=desc) + missing
+        else:
+            rows.sort(key=int)
+        for n, iid in enumerate(rows):
+            self.tree.move(iid, '', n)
+        for c in self._SORT_KEYS:
+            arrow = (' ▼' if desc else ' ▲') if c == col else ''
+            self.tree.heading(c, text=c.capitalize() + arrow)
+        self._anchor = None  # Shift-click ranges follow what's on screen
 
     def _set_checked(self, iid, on):
         if on:
