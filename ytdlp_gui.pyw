@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.parse
 from tkinter import filedialog, messagebox, ttk
 
 FROZEN = getattr(sys, 'frozen', False)
@@ -488,6 +489,10 @@ DEFAULTS = {
     'watch_clipboard': False,
     'clear_done': True,
     'clean_on_cancel': True,
+    'go_easy_youtube': True,
+    'notify_done': True,
+    'notify_sound': False,
+    'tray_on_minimize': False,
     'suno_id': True,
     'preview_volume': 50.0,
     'clip_precise': True,
@@ -602,6 +607,26 @@ def open_path(path):
         messagebox.showerror(APP_NAME, f'Could not open:\n{path}\n\n{e}')
 
 
+_YT_RE = re.compile(r'(?:^|//|\.)(?:youtube\.com|youtu\.be|youtube-nocookie\.com)(?:/|$)', re.I)
+
+
+def has_youtube(jobs):
+    """True if any link (or queued item) in a batch is YouTube / YouTube Music."""
+    for j in jobs:
+        if isinstance(j, str):
+            url = j
+        else:
+            item = j[1]
+            url = item if isinstance(item, str) else (item.get('url') or '') + ' ' + (item.get('ie_key') or '')
+        if _YT_RE.search(url) or 'Youtube' in url or url.startswith('ytsearch'):
+            return True
+    return False
+
+
+GO_EASY_ARGS = ['--sleep-interval', '3', '--max-sleep-interval', '8', '--sleep-requests', '0.5']
+GO_EASY_MAX_PARALLEL = 2
+
+
 def out_folder(s):
     """The download folder for the current mode."""
     if s.get('mode') == 'audio' and s.get('outdir_audio'):
@@ -630,22 +655,59 @@ def clip_range(s):
     return start, end
 
 
+def _before_ext(template, extra):
+    return (template[:-len('.%(ext)s')] + extra + '.%(ext)s'
+            if template.endswith('.%(ext)s') else template + extra)
+
+
+def output_template(s, clip=None):
+    """The file-name pattern actually used: the user's pattern plus the Suno ID and clip labels."""
+    template = s['template'] or DEFAULTS['template']
+    if s.get('suno_id', True) and '%(id)s' not in template:
+        template = _before_ext(template, '%(suno_tag|)s')  # Suno only: " [4f85f050]"; empty for other sites
+    if clip:
+        # keep clips from overwriting (or being skipped because of) the full download
+        template = _before_ext(template, ' [clip %(section_start).1f-%(section_end).1fs]' if clip[1] is not None
+                               else ' [from %(section_start).1fs]')
+    return template
+
+
+def example_filename(s):
+    """What a downloaded file would be called with these settings (for the preview under File name)."""
+    try:
+        clip = clip_range(s)
+    except SettingsError:
+        clip = None
+    template = output_template(s, clip)
+    if s.get('mode') == 'audio':
+        fmt = s.get('audio_format') or 'mp3'
+        ext = 'opus' if fmt.startswith('Best') else fmt
+    else:
+        ext = {'Any': 'webm'}.get(s.get('container'), s.get('container') or 'mp4')
+    sample = {'id': 'dQw4w9WgXcQ', 'title': 'Example Video', 'ext': ext, 'uploader': 'Example Channel',
+              'channel': 'Example Channel', 'upload_date': '20260115', 'timestamp': 1768471200,
+              'extractor': 'youtube', 'extractor_key': 'Youtube', 'duration': 245}
+    if 'playlist' in template:
+        sample.update(playlist='Example Playlist', playlist_title='Example Playlist', playlist_index=3,
+                      playlist_count=12, playlist_autonumber=3)
+    if clip:
+        sample.update(section_start=clip[0], section_end=clip[1] if clip[1] is not None else 245)
+    try:
+        with yt_dlp.YoutubeDL({'outtmpl': template, 'paths': {'home': out_folder(s) or ''}, 'quiet': True,
+                               'no_warnings': True, 'logger': GuiLogger(queue.Queue())}) as y:
+            name = y.prepare_filename(sample)
+    except Exception as e:
+        return f'(this pattern has a problem: {e})'
+    return name
+
+
 def build_args(s):
     """Turn GUI settings into yt-dlp command-line arguments."""
     args = ['--newline', '--no-colors']
-    template = s['template'] or DEFAULTS['template']
-    if s.get('suno_id', True) and '%(id)s' not in template:
-        # Suno only: " [4f85f050]" before the extension (empty for every other site)
-        template = (template[:-len('.%(ext)s')] + '%(suno_tag|)s.%(ext)s'
-                    if template.endswith('.%(ext)s') else template + '%(suno_tag|)s')
     clip = clip_range(s)
+    template = output_template(s, clip)
     if clip:
         start, end = clip
-        # keep clips from overwriting (or being skipped because of) the full download
-        suffix = (' [clip %(section_start).1f-%(section_end).1fs]' if end is not None
-                  else ' [from %(section_start).1fs]')
-        template = (template[:-len('.%(ext)s')] + suffix + '.%(ext)s'
-                    if template.endswith('.%(ext)s') else template + suffix)
         args += ['--download-sections', f'*{start:g}-{end:g}' if end is not None else f'*{start:g}-inf']
         if s.get('clip_precise'):
             args += ['--force-keyframes-at-cuts']
@@ -702,6 +764,10 @@ _SKIP_HISTORY_RE = re.compile(r'^\[download\] (?:(?P<id>[^\s:]+): )?(?P<title>.*
 _SKIP_EXISTS_RE = re.compile(r'^\[download\] (?P<path>.+?) has already been downloaded$')
 
 
+class ItemCancelled(DownloadCancelled):
+    """One item was cancelled from its right-click menu; the rest of the batch carries on."""
+
+
 class GuiLogger:
     def __init__(self, q, on_error=None, on_exists=None):
         self.q = q
@@ -744,6 +810,9 @@ class GuiLogger:
     def error(self, msg):
         if self.on_error:
             self.on_error()
+        low = msg.lower()
+        if 'confirm you' in low and 'not a bot' in low:
+            self.q.put(('bot_check', None))
         self.q.put(('log', msg))
 
 
@@ -751,12 +820,15 @@ class Worker(threading.Thread):
     """Runs downloads. `jobs` is a list of URLs, or of ('url', url, None) / ('entry', entry, extra) tuples
     (the latter is how failed playlist items are retried with their playlist numbering intact)."""
 
-    def __init__(self, jobs, args, q, parallel=1, args_whole=None, clip_confirmed=False, clean_on_cancel=True):
+    def __init__(self, jobs, args, q, parallel=1, args_whole=None, clip_confirmed=False, clean_on_cancel=True,
+                 format_overrides=None):
         super().__init__(daemon=True)
+        self.format_overrides = dict(format_overrides or {})  # link -> exact format for that link only
         self.clean_on_cancel = clean_on_cancel
         self._started_at = time.time()
         self._touched = {}       # item id -> files yt-dlp wrote for it (partial downloads, pieces, temp files)
         self._finished = set()   # item ids whose file reached its final place
+        self.cancel_keys = set() # items cancelled one by one from the list
         # args_whole: the same settings without the clip, used if the user chooses to download a playlist whole
         self.args_whole = args_whole
         self._clip_choice = 'clip' if clip_confirmed else None
@@ -786,6 +858,10 @@ class Worker(threading.Thread):
             self.errors += 1
         self._tl.errors = getattr(self._tl, 'errors', 0) + 1
 
+    def cancel_item(self, key):
+        with self._lock:
+            self.cancel_keys.add(key)
+
     def _track(self, key, *paths):
         paths = [p for p in paths if p]
         if paths:
@@ -799,6 +875,8 @@ class Worker(threading.Thread):
         self._track(key, d.get('tmpfilename'), d.get('filename'), info.get('_filename'), info.get('filepath'))
         if self.cancel.is_set():
             raise DownloadCancelled('Cancelled by user')
+        if key in self.cancel_keys:
+            raise ItemCancelled(f'Cancelled {info.get("title") or key}')
         total = d.get('total_bytes') or d.get('total_bytes_estimate')
         done = d.get('downloaded_bytes') or 0
         self.q.put(('progress', {
@@ -824,6 +902,8 @@ class Worker(threading.Thread):
             self._track(key, info.get('filepath'), info.get('_filename'))
         if self.cancel.is_set():
             raise DownloadCancelled('Cancelled by user')
+        if key in self.cancel_keys and not (d.get('status') == 'finished' and d.get('postprocessor') == 'MoveFiles'):
+            raise ItemCancelled(f'Cancelled {info.get("title") or key}')
         if d.get('status') == 'started':
             self.q.put(('pp', {'key': key, 'title': info.get('title'), 'pp': d.get('postprocessor')}))
         elif d.get('status') == 'finished' and d.get('postprocessor') == 'MoveFiles':
@@ -965,6 +1045,8 @@ class Worker(threading.Thread):
                     try:
                         if self.cancel.is_set():
                             continue
+                        if kind != 'url' and isinstance(item, dict) and item.get('id') in self.cancel_keys:
+                            raise ItemCancelled('cancelled before it started')
                         if kind == 'url':
                             self.q.put(('log', f'=== {item}'))
                             entries, info = self._expand(ydl, item)
@@ -973,7 +1055,16 @@ class Worker(threading.Thread):
                                     self.q.put(('log', f'Skipping {info.get("title") or item}: '
                                                        'already being downloaded in this batch'))
                                 elif info is not None:
-                                    ydl.process_ie_result(info, download=True)
+                                    spec = self.format_overrides.get(item)
+                                    if spec:  # this link has an exact quality chosen in the Formats window
+                                        saved = ydl.format_selector, ydl.params.get('format')
+                                        ydl.format_selector = ydl.build_format_selector(spec)
+                                        ydl.params['format'] = spec
+                                    try:
+                                        ydl.process_ie_result(info, download=True)
+                                    finally:
+                                        if spec:
+                                            ydl.format_selector, ydl.params['format'] = saved
                                 else:
                                     ydl.download([item])
                             elif entries:
@@ -1008,6 +1099,16 @@ class Worker(threading.Thread):
                         if getattr(self._tl, 'errors', 0) > before:
                             failed(kind, item, extra, info)
                         finish_one()
+                    except ItemCancelled:
+                        key = (info or {}).get('id') if kind == 'url' else item.get('id')
+                        root = item if kind == 'url' else self._root.get(id(item))
+                        with self._lock:
+                            if root:
+                                self._failed_roots.add(root)  # not finished, so its link stays in the box
+                        if self.clean_on_cancel and key:
+                            self._clean_up_unfinished({key})
+                        self.q.put(('item_cancelled', {'key': key, 'job': (kind, item, extra)}))
+                        finish_one()
                     except DownloadCancelled:
                         self.cancel.set()
                     except Exception as e:
@@ -1030,13 +1131,14 @@ class Worker(threading.Thread):
         for t in threads:
             t.join()
 
-    def _leftovers(self):
+    def _leftovers(self, keys=None):
         """Files belonging to items that didn't finish: partial downloads, separate video/audio pieces,
         fragments, half-merged temp files and resume markers. Only files changed during this run."""
         import glob
         from yt_dlp.utils import prepend_extension
         with self._lock:
-            unfinished = {k: set(v) for k, v in self._touched.items() if k not in self._finished}
+            unfinished = {k: set(v) for k, v in self._touched.items()
+                          if k not in self._finished and (keys is None or k in keys)}
             protected = set(self._existing)
         found = set()
         for paths in unfinished.values():
@@ -1057,8 +1159,8 @@ class Worker(threading.Thread):
                         pass
         return sorted(found)
 
-    def _clean_up_unfinished(self):
-        files = self._leftovers()
+    def _clean_up_unfinished(self, keys=None):
+        files = self._leftovers(keys)
         removed, stuck = [], []
         for f in files:
             for attempt in range(6):  # FFmpeg may still be letting go of a file for a moment
@@ -1939,6 +2041,181 @@ class PreviewWindow(tk.Toplevel):
         self.destroy()
 
 
+def describe_formats(info):
+    """Rows for the Formats window: [{'id', 'kind', 'quality', 'fps', 'codec', 'ext', 'size', 'bytes', 'note'}]."""
+    rows = []
+    for f in info.get('formats') or []:
+        if not f.get('format_id') or f.get('ext') == 'mhtml':  # storyboards are not real formats
+            continue
+        v, a = f.get('vcodec') not in (None, 'none'), f.get('acodec') not in (None, 'none')
+        if f.get('vcodec') is None and f.get('acodec') is None:
+            v = a = True  # unknown: treat as a complete file
+        kind = 'video + audio' if v and a else 'video only' if v else 'audio only' if a else '?'
+        if v:
+            quality = (f'{f["height"]}p' if f.get('height') else f.get('resolution') or f.get('format_note') or '?')
+        else:
+            quality = f'{round(f["abr"])} kbps' if f.get('abr') else (f.get('format_note') or '?')
+        size = f.get('filesize') or f.get('filesize_approx')
+        codec = ' / '.join(c.split('.')[0] for c in (f.get('vcodec'), f.get('acodec'))
+                           if c and c != 'none')
+        rows.append({
+            'id': f['format_id'], 'kind': kind, 'quality': quality,
+            'fps': str(round(f['fps'])) if v and f.get('fps') else '',
+            'codec': codec, 'ext': f.get('ext') or '', 'bytes': size or 0,
+            'size': ('≈ ' if not f.get('filesize') and size else '') + (human_bytes(size) if size else '?'),
+            'note': f.get('format_note') or '', 'height': f.get('height') or 0, 'abr': f.get('abr') or 0,
+            'tbr': f.get('tbr') or 0, 'v': v, 'a': a,
+        })
+    order = {'video + audio': 0, 'video only': 1, 'audio only': 2}
+    rows.sort(key=lambda r: (order.get(r['kind'], 3), -r['height'], -r['abr'], -r['tbr']))
+    return rows
+
+
+def format_spec(selected):
+    """yt-dlp format string for the chosen rows: one complete file, or 'video+audio'."""
+    vids = [r for r in selected if r['v']]
+    auds = [r for r in selected if r['a'] and not r['v']]
+    if len(selected) == 1:
+        return selected[0]['id']
+    if len(vids) == 1 and len(auds) == 1 and not vids[0]['a']:
+        return f"{vids[0]['id']}+{auds[0]['id']}"
+    return None
+
+
+class FormatsWindow(tk.Toplevel):
+    """Every quality a link offers, with sizes; the choice applies to that link only."""
+
+    def __init__(self, app, url):
+        super().__init__(app)
+        self.app, self.url = app, url
+        p = app.palette
+        self.title('Choose an exact quality')
+        self.configure(bg=p['bg'])
+        self.geometry('900x560')
+        self.minsize(700, 400)
+        self.transient(app)
+        self.q = queue.Queue()
+        self.rows = []
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill='both', expand=True)
+        self.lbl_title = ttk.Label(outer, text='Looking up the available qualities…', style='Head.TLabel',
+                                   wraplength=860)
+        self.lbl_title.pack(anchor='w')
+        ttk.Label(outer, style='Hint.TLabel',
+                  text='Pick one row, or a "video only" row plus an "audio only" row (Ctrl+click). '
+                       'This choice applies to this link only.').pack(anchor='w', pady=(2, 6))
+        mid = ttk.Frame(outer)
+        mid.pack(fill='both', expand=True)
+        cols = ('kind', 'quality', 'fps', 'ext', 'codec', 'size', 'note', 'id')
+        self.tree = ttk.Treeview(mid, columns=cols, show='headings', selectmode='extended')
+        for c, w, a in (('kind', 110, 'w'), ('quality', 90, 'w'), ('fps', 45, 'e'), ('ext', 55, 'w'),
+                        ('codec', 140, 'w'), ('size', 95, 'e'), ('note', 170, 'w'), ('id', 70, 'w')):
+            self.tree.heading(c, text={'kind': 'Type', 'fps': 'FPS', 'ext': 'File', 'id': 'Format ID'}.get(
+                c, c.capitalize()))
+            self.tree.column(c, width=w, anchor=a, stretch=(c == 'note'))
+        sb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        self.tree.bind('<<TreeviewSelect>>', lambda e: self._on_select())
+        self.tree.bind('<Double-1>', lambda e: self._apply())
+        bot = ttk.Frame(outer)
+        bot.pack(fill='x', pady=(8, 0))
+        self.lbl_sel = ttk.Label(bot, text='')
+        self.lbl_sel.pack(side='left')
+        self.btn_use = ttk.Button(bot, text='Use this quality', style='Accent.TButton', command=self._apply,
+                                  state='disabled')
+        self.btn_use.pack(side='right')
+        ttk.Button(bot, text='Cancel', command=self.destroy).pack(side='right', padx=6)
+        ttk.Button(bot, text='Back to automatic', command=self._clear).pack(side='right')
+        app._set_titlebar(self)
+        self._bg()
+        self.after(50, self._pump)
+
+    def _bg(self):
+        settings = self.app._collect()
+
+        def work():
+            try:
+                opts = dict(yt_dlp.parse_options(build_args({**settings, 'clip_start': '', 'clip_end': ''})).ydl_opts)
+                opts.update(noplaylist=True, quiet=True, no_warnings=True, logger=GuiLogger(queue.Queue()),
+                            format='best/bestvideo+bestaudio/bestvideo/bestaudio', postprocessors=[])
+                for k in ('download_ranges', 'download_archive'):
+                    opts.pop(k, None)
+                with make_ydl(opts) as ydl:
+                    info = ydl.extract_info(self.url, download=False, process=False)
+                    if info and info.get('_type') in ('playlist', 'multi_video'):
+                        self.q.put(('playlist', info.get('title')))
+                        return
+                    info = ydl.process_ie_result(info, download=False)
+                self.q.put(('info', info))
+            except Exception as e:
+                self.q.put(('error', str(e).replace('ERROR: ', '')))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _pump(self):
+        try:
+            kind, data = self.q.get_nowait()
+        except queue.Empty:
+            if self.winfo_exists():
+                self.after(80, self._pump)
+            return
+        if kind == 'error':
+            self.lbl_title.configure(text=f"Couldn't read the qualities: {data}")
+        elif kind == 'playlist':
+            self.lbl_title.configure(text=f'"{data}" is a playlist. Exact qualities differ from video to video, '
+                                          'so use Max quality / Audio quality for playlists instead.')
+        else:
+            self.lbl_title.configure(text=f"{data.get('title') or self.url}"
+                                          + (f"  ({human_eta(data['duration'])})" if data.get('duration') else ''))
+            self.rows = describe_formats(data)
+            current = self.app.format_overrides.get(self.url, '')
+            chosen = set(current.split('+')) if current else set()
+            for i, r in enumerate(self.rows):
+                self.tree.insert('', 'end', iid=str(i), values=(r['kind'], r['quality'], r['fps'], r['ext'],
+                                                                r['codec'], r['size'], r['note'], r['id']))
+                if r['id'] in chosen:
+                    self.tree.selection_add(str(i))
+            if not self.rows:
+                self.lbl_sel.configure(text='This link reports no separate qualities.')
+
+    def _selected(self):
+        return [self.rows[int(i)] for i in self.tree.selection()]
+
+    def _on_select(self):
+        sel = self._selected()
+        spec = format_spec(sel)
+        if not sel:
+            self.lbl_sel.configure(text='')
+        elif spec is None:
+            self.lbl_sel.configure(text='Choose one row, or one "video only" plus one "audio only".')
+        else:
+            total = sum(r['bytes'] for r in sel)
+            parts = ' + '.join(f"{r['quality']} {r['kind'].split()[0]}" for r in sel)
+            warn = ''
+            if self.app.mode.get() == 'audio' and not any(r['a'] for r in sel):
+                warn = '   (Audio-only mode needs a row with audio)'
+            elif len(sel) == 1 and sel[0]['kind'] == 'video only':
+                warn = '   (no sound — add an "audio only" row with Ctrl+click)'
+            self.lbl_sel.configure(text=f'{parts}' + (f'  ≈ {human_bytes(total)}' if total else '') + warn)
+        ok = spec is not None and not (self.app.mode.get() == 'audio' and not any(r['a'] for r in sel))
+        self.btn_use.configure(state='normal' if ok else 'disabled')
+
+    def _apply(self):
+        spec = format_spec(self._selected())
+        if not spec:
+            return
+        self.app.format_overrides[self.url] = spec
+        self.app._show_overrides()
+        self.app._log(f'Exact quality for {self.url}: format {spec}')
+        self.destroy()
+
+    def _clear(self):
+        self.app.format_overrides.pop(self.url, None)
+        self.app._show_overrides()
+        self.destroy()
+
+
 class ArgPicker(tk.Toplevel):
     """Checkbox list of every yt-dlp option, written back into 'Extra arguments'."""
 
@@ -2179,6 +2456,342 @@ class ArgPicker(tk.Toplevel):
         self.destroy()
 
 
+SEARCH_SITES = {
+    'YouTube': lambda q, n: f'ytsearch{n}:{q}',
+    'YouTube — newest first': lambda q, n: 'https://www.youtube.com/results?search_query='
+                                           f'{urllib.parse.quote_plus(q)}&sp=CAISAhAB',
+    'YouTube Music (songs)': lambda q, n: f'https://music.youtube.com/search?q={urllib.parse.quote_plus(q)}#songs',
+    'SoundCloud': lambda q, n: f'scsearch{n}:{q}',
+}
+
+
+def _pick_thumb(thumbs):
+    """The thumbnail closest to 300px wide (small enough to fetch fast, big enough to look sharp)."""
+    thumbs = [t for t in thumbs or [] if t.get('url')]
+    if not thumbs:
+        return None
+    sized = [t for t in thumbs if t.get('width')]
+    return (min(sized, key=lambda t: abs(t['width'] - 300)) if sized else thumbs[-1])['url']
+
+
+def run_search(site, query, n, settings):
+    """Up to n results for a search: [{'url', 'id', 'title', 'channel', 'duration', 'views', 'thumb'}]."""
+    target = SEARCH_SITES[site](query, n)
+    opts = dict(yt_dlp.parse_options(build_args({**settings, 'clip_start': '', 'clip_end': ''})).ydl_opts)
+    opts.update(extract_flat='in_playlist', playlistend=n, quiet=True, no_warnings=True, skip_download=True,
+                noplaylist=False, logger=GuiLogger(queue.Queue()), postprocessors=[])
+    for k in ('download_ranges', 'download_archive', 'sleep_interval', 'max_sleep_interval'):
+        opts.pop(k, None)
+    with make_ydl(opts) as ydl:
+        info = ydl.extract_info(target, download=False)
+    results = []
+    for e in (info or {}).get('entries') or []:
+        if not e:
+            continue
+        vid = e.get('id')
+        youtube = (e.get('ie_key') or e.get('extractor_key') or '').startswith('Youtube') or 'youtube' in (e.get('url') or '')
+        if youtube and e.get('_type') == 'url' and e.get('ie_key') not in (None, 'Youtube'):
+            continue  # channels/playlists mixed into results
+        url = f'https://www.youtube.com/watch?v={vid}' if youtube and vid else (e.get('webpage_url') or e.get('url'))
+        if not url:
+            continue
+        thumb = (f'https://i.ytimg.com/vi/{vid}/mqdefault.jpg' if youtube and vid
+                 else e.get('thumbnail') or _pick_thumb(e.get('thumbnails')))
+        results.append({
+            'url': url, 'id': vid, 'title': e.get('title') or url,
+            'channel': e.get('channel') or e.get('uploader') or traverse_obj(e, ('artists', 0)) or '',
+            'duration': e.get('duration'), 'views': e.get('view_count'), 'thumb': thumb,
+        })
+        if len(results) >= n:
+            break
+    return results
+
+
+def fetch_thumbnail(url, width=120, height=68):
+    """A thumbnail as PNG bytes (Tk can't show JPEG/WebP), letterboxed to width x height. None if unavailable."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    import io
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=15, context=_https_context()) as r:
+            data = r.read(3_000_000)
+        im = Image.open(io.BytesIO(data)).convert('RGB')
+        im.thumbnail((width, height))
+        canvas = Image.new('RGB', (width, height), (0, 0, 0))
+        canvas.paste(im, ((width - im.width) // 2, (height - im.height) // 2))
+        out = io.BytesIO()
+        canvas.save(out, 'PNG')
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+def human_count(n):
+    if not n:
+        return ''
+    for div, unit in ((1e9, 'B'), (1e6, 'M'), (1e3, 'K')):
+        if n >= div:
+            return f'{n / div:.1f}'.rstrip('0').rstrip('.') + unit
+    return str(n)
+
+
+class SearchWindow(tk.Toplevel):
+    """Search a site, tick results and add them to the download list."""
+    STEP, MAX = 20, 200
+
+    def __init__(self, app, query='', site='YouTube'):
+        super().__init__(app)
+        import base64
+        self._b64 = base64.b64encode
+        self.app = app
+        p = app.palette
+        self.title('Search')
+        self.configure(bg=p['bg'])
+        self.geometry('1000x660')
+        self.minsize(760, 460)
+        self.q = queue.Queue()
+        self.results, self.images, self.n = [], {}, self.STEP
+        self._gen = 0
+        self._thumb_slots = threading.Semaphore(6)
+
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill='both', expand=True)
+        top = ttk.Frame(outer)
+        top.pack(fill='x')
+        self.query = tk.StringVar(value=query)
+        ent = ttk.Entry(top, textvariable=self.query, font=('Segoe UI', 11))
+        ent.pack(side='left', fill='x', expand=True)
+        ent.bind('<Return>', lambda e: self.search())
+        self.site = tk.StringVar(value=site if site in SEARCH_SITES else 'YouTube')
+        ttk.Combobox(top, textvariable=self.site, values=list(SEARCH_SITES), state='readonly', width=22).pack(
+            side='left', padx=6)
+        ttk.Button(top, text='Search', style='Accent.TButton', command=self.search).pack(side='left')
+
+        mid = ttk.Frame(outer)
+        mid.pack(fill='both', expand=True, pady=8)
+        ttk.Style(self).configure('Search.Treeview', rowheight=74)
+        self.tree = ttk.Treeview(mid, columns=('title', 'channel', 'length', 'views'), show='tree headings',
+                                 selectmode='extended', style='Search.Treeview')
+        self.tree.heading('#0', text='')
+        self.tree.column('#0', width=136, stretch=False)
+        for c, w, a in (('title', 420, 'w'), ('channel', 180, 'w'), ('length', 70, 'e'), ('views', 70, 'e')):
+            self.tree.heading(c, text=c.capitalize())
+            self.tree.column(c, width=w, anchor=a, stretch=(c == 'title'))
+        sb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        self.tree.bind('<<TreeviewSelect>>', lambda e: self._update_count())
+        self.tree.bind('<Double-1>', lambda e: self._open_in_browser())
+        self.tree.bind('<Button-3>', self._menu)
+
+        bot = ttk.Frame(outer)
+        bot.pack(fill='x')
+        self.status = tk.StringVar(value='Type something and press Enter.')
+        ttk.Label(bot, textvariable=self.status).pack(side='left')
+        self.btn_now = ttk.Button(bot, text='Download now', style='Accent.TButton', command=lambda: self._add(True),
+                                  state='disabled')
+        self.btn_now.pack(side='right')
+        self.btn_add = ttk.Button(bot, text='Add to list', command=lambda: self._add(False), state='disabled')
+        self.btn_add.pack(side='right', padx=6)
+        self.btn_more = ttk.Button(bot, text='Load more', command=self.more, state='disabled')
+        self.btn_more.pack(side='right', padx=(0, 12))
+        ttk.Button(bot, text='Select all', command=lambda: self.tree.selection_set(self.tree.get_children())).pack(
+            side='right')
+        ttk.Label(outer, style='Hint.TLabel',
+                  text='Click to select (Ctrl/Shift for several) · double-click opens it in your browser · '
+                       'right-click to preview or check formats').pack(anchor='w', pady=(6, 0))
+        app._set_titlebar(self)
+        ent.focus_set()
+        self.after(60, self._pump)
+        if query.strip():
+            self.search()
+
+    def search(self, more=False):
+        q = self.query.get().strip()
+        if not q:
+            return
+        if not more:
+            self.n = self.STEP
+            self.tree.delete(*self.tree.get_children())
+            self.results, self.images = [], {}
+        self._gen += 1
+        gen, site, n, settings = self._gen, self.site.get(), self.n, self.app._collect()
+        self.status.set(f'Searching {site} for "{q}"…')
+        self.btn_more.configure(state='disabled')
+
+        def work():
+            try:
+                self.q.put(('results', gen, run_search(site, q, n, settings)))
+            except Exception as e:
+                self.q.put(('error', gen, str(e).replace('ERROR: ', '')))
+        threading.Thread(target=work, daemon=True).start()
+
+    def more(self):
+        if self.n < self.MAX:
+            self.n = min(self.MAX, self.n + self.STEP)
+            self.search(more=True)
+
+    def _pump(self):
+        try:
+            while True:
+                kind, gen, data = self.q.get_nowait()
+                if gen != self._gen:
+                    continue  # from an older search
+                if kind == 'error':
+                    self.status.set(f'Search failed: {data}')
+                elif kind == 'results':
+                    have = {r['url'] for r in self.results}
+                    new = [r for r in data if r['url'] not in have]
+                    for r in new:
+                        i = str(len(self.results))
+                        self.results.append(r)
+                        self.tree.insert('', 'end', iid=i, text='', values=(
+                            r['title'], r['channel'], human_eta(r['duration']) if r['duration'] else '',
+                            human_count(r['views'])))
+                        if r['thumb']:
+                            self._load_thumb(gen, i, r['thumb'])
+                    shown = len(self.results)
+                    self.status.set(f'{shown} result{"s" if shown != 1 else ""}' if shown else 'No results.')
+                    can_more = shown >= self.n and self.n < self.MAX
+                    self.btn_more.configure(state='normal' if can_more else 'disabled')
+                    self._update_count()
+                elif kind == 'thumb':
+                    iid, png = data
+                    if png and self.tree.exists(iid):
+                        img = tk.PhotoImage(data=self._b64(png).decode())
+                        self.images[iid] = img
+                        self.tree.item(iid, image=img)
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(60, self._pump)
+
+    def _load_thumb(self, gen, iid, url):
+        def work():
+            with self._thumb_slots:
+                if gen == self._gen:
+                    self.q.put(('thumb', gen, (iid, fetch_thumbnail(url))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _selected(self):
+        return [self.results[int(i)] for i in self.tree.selection()]
+
+    def _update_count(self):
+        n = len(self.tree.selection())
+        for b in (self.btn_add, self.btn_now):
+            b.configure(state='normal' if n else 'disabled')
+        if n:
+            self.btn_add.configure(text=f'Add {n} to list')
+
+    def _add(self, start):
+        urls = [r['url'] for r in self._selected()]
+        if not urls:
+            return
+        added = self.app._add_urls(urls, 'search')
+        self.status.set(f'Added {added} to the list' if added else 'Already in the list')
+        if start and not self.app._busy():
+            self.app._start()
+        elif start:
+            self.status.set('Added — downloads are already running; press Download when they finish')
+
+    def _open_in_browser(self):
+        sel = self._selected()
+        if sel:
+            __import__('webbrowser').open(sel[0]['url'])
+
+    def _menu(self, e):
+        iid = self.tree.identify_row(e.y)
+        if not iid:
+            return
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        r = self.results[int(iid)]
+        p = self.app.palette
+        m = tk.Menu(self, tearoff=0, background=p['surface'], foreground=p['fg'],
+                    activebackground=p['accent'], activeforeground=p['on_accent'])
+        m.add_command(label='Preview & clip…', command=lambda: PreviewWindow(self.app, r['url']))
+        m.add_command(label='Choose exact quality…', command=lambda: FormatsWindow(self.app, r['url']))
+        m.add_separator()
+        m.add_command(label='Open in browser', command=lambda: __import__('webbrowser').open(r['url']))
+        m.add_command(label='Copy link', command=lambda: self.app._copy(r['url']))
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+
+class Tray:
+    """System-tray icon (pystray): 'downloads finished' notifications and a place to minimize to.
+    Quietly does nothing if pystray isn't available (e.g. running from source without it)."""
+
+    def __init__(self, app):
+        self.app = app
+        self.icon = None
+        self._ready = 0.0
+
+    def _image(self):
+        from PIL import Image
+        for d in (RES_DIR, HERE):
+            path = os.path.join(d, 'assets', 'grabbit_64.png')
+            if os.path.exists(path):
+                return Image.open(path)
+        return Image.new('RGBA', (64, 64), (217, 119, 87, 255))
+
+    def ensure(self):
+        if self.icon is not None:
+            return True
+        try:
+            import pystray
+            q = self.app.q
+            menu = pystray.Menu(
+                pystray.MenuItem(f'Show {APP_NAME}', lambda: q.put(('tray', 'show')), default=True),
+                pystray.MenuItem('Quit', lambda: q.put(('tray', 'quit'))))
+            self.icon = pystray.Icon(APP_NAME, self._image(), APP_NAME, menu)
+            self.icon.run_detached()
+            self._ready = time.time() + 0.6  # Windows needs a moment before the icon can show balloons
+            return True
+        except Exception:
+            self.icon = None
+            return False
+
+    def notify(self, title, message):
+        if not self.ensure():
+            return False
+
+        def show():
+            try:
+                self.icon.notify(message, title)
+            except Exception:
+                pass
+        delay = max(0.0, self._ready - time.time())
+        threading.Timer(delay, show).start() if delay else show()
+        return True
+
+    def stop(self):
+        if self.icon is not None:
+            try:
+                self.icon.stop()
+            except Exception:
+                pass
+            self.icon = None
+
+
+def play_done_sound():
+    try:
+        import winsound
+        winsound.PlaySound('SystemAsterisk', winsound.SND_ALIAS | winsound.SND_ASYNC)
+    except Exception:
+        try:
+            print('\a', end='', flush=True)
+        except Exception:
+            pass
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -2191,8 +2804,10 @@ class App(tk.Tk):
         self.worker = None
         self.rows = {}
         self.settings = dict(DEFAULTS)
+        self.format_overrides = {}  # link -> exact yt-dlp format chosen in the Formats window
         self._col_widths = {}
         self._skipped = 0
+        self.tray = Tray(self)
         self._load_settings()
         self.palette = PALETTES['dark' if self.settings.get('dark', True) else 'light']
         self._style()
@@ -2200,12 +2815,18 @@ class App(tk.Tk):
         self._apply_settings()
         self._apply_theme()
         self._on_mode()
+        self._example_job = None
+        for v in (self.template, self.mode, self.outdir, self.outdir_audio, self.audio_format, self.container,
+                  self.suno_id, self.clip_start, self.clip_end):
+            v.trace_add('write', lambda *_: self._schedule_example())
+        self._update_example()
         self.after(100, self._poll)
         self.after(2000, lambda: self._check_updates(quiet=True))
         self._clip_last = self._read_clipboard()
         self.after(700, self._poll_clipboard)
         self._enable_drag_and_drop()
         self.protocol('WM_DELETE_WINDOW', self._on_close)
+        self.bind('<Unmap>', self._on_unmap)
         if not shutil.which('ffmpeg'):
             self._log('WARNING: FFmpeg was not found on PATH. Merging best video+audio, '
                       'audio conversion and embedding need it. Get it from https://ffmpeg.org '
@@ -2367,25 +2988,43 @@ class App(tk.Tk):
 
         # URLs
         self.banner = tk.Frame(root)  # 'update available' strip, shown when needed
+        sbar = ttk.Frame(root)
+        self._first_section = sbar
+        sbar.pack(fill='x', pady=(0, 8))
+        ttk.Label(sbar, text='Search').pack(side='left', padx=(0, 6))
+        self.search_query = tk.StringVar()
+        ent = ttk.Entry(sbar, textvariable=self.search_query)
+        ent.pack(side='left', fill='x', expand=True)
+        ent.bind('<Return>', lambda e: self._open_search())
+        self.search_site = tk.StringVar(value='YouTube')
+        ttk.Combobox(sbar, textvariable=self.search_site, values=list(SEARCH_SITES), state='readonly',
+                     width=22).pack(side='left', padx=6)
+        ttk.Button(sbar, text='Search', command=self._open_search).pack(side='left')
+        self._search_win = None
         top = ttk.LabelFrame(root, text='URLs (one per line — videos, playlists or channels)', padding=8)
-        self._first_section = top
+        self._url_section = top
         top.pack(fill='x')
         self.url_text = tk.Text(top, height=4, wrap='none', font=('Consolas', 10), undo=True)
-        self.url_text.grid(row=0, column=0, rowspan=3, sticky='nsew')
+        self.url_text.grid(row=0, column=0, rowspan=4, sticky='nsew')
         top.columnconfigure(0, weight=1)
         ttk.Button(top, text='Paste', command=self._paste).grid(row=0, column=1, sticky='ew', padx=(8, 0))
         ttk.Button(top, text='Clear', command=lambda: self.url_text.delete('1.0', 'end')).grid(
             row=1, column=1, sticky='ew', padx=(8, 0), pady=4)
         ttk.Button(top, text='From file…', command=self._load_urls).grid(row=2, column=1, sticky='ew', padx=(8, 0))
+        ttk.Button(top, text='Formats…', command=self._open_formats).grid(row=3, column=1, sticky='ew', padx=(8, 0),
+                                                                           pady=(4, 0))
         self.watch_clipboard = tk.BooleanVar()
         self.preview_volume = tk.DoubleVar()  # used by the Preview & clip window
         self.clear_done = tk.BooleanVar()
         opts_row = ttk.Frame(top)
-        opts_row.grid(row=3, column=0, columnspan=2, sticky='w', pady=(6, 0))
+        opts_row.grid(row=4, column=0, columnspan=2, sticky='ew', pady=(6, 0))
         ttk.Checkbutton(opts_row, text='Watch clipboard — links you copy are added automatically',
                         variable=self.watch_clipboard, command=self._on_watch_toggle).pack(side='left')
         ttk.Checkbutton(opts_row, text='Clear links when finished (failed ones stay)',
                         variable=self.clear_done).pack(side='left', padx=(20, 0))
+        self.lbl_overrides = ttk.Label(opts_row, text='', style='Active.TLabel', cursor='hand2')
+        self.lbl_overrides.pack(side='right')
+        self.lbl_overrides.bind('<Button-1>', lambda e: self._clear_overrides())
 
         # Options
         opt = ttk.Frame(root)
@@ -2469,6 +3108,18 @@ class App(tk.Tk):
         self.clean_on_cancel = tk.BooleanVar()
         ttk.Checkbutton(ext, text='Delete unfinished files when I cancel', variable=self.clean_on_cancel).grid(
             row=8, column=0, columnspan=2, sticky='w', pady=(2, 0))
+        self.go_easy_youtube = tk.BooleanVar()
+        ttk.Checkbutton(ext, text='Go easy on YouTube (pauses, max 2 at once — avoids the "not a bot" block)',
+                        variable=self.go_easy_youtube).grid(row=9, column=0, columnspan=2, sticky='w', pady=(2, 0))
+        self.notify_done = tk.BooleanVar()
+        self.notify_sound = tk.BooleanVar()
+        self.tray_on_minimize = tk.BooleanVar()
+        nt = ttk.Frame(ext)
+        nt.grid(row=10, column=0, columnspan=2, sticky='w', pady=(2, 0))
+        ttk.Checkbutton(nt, text='Notify me when done', variable=self.notify_done).pack(side='left')
+        ttk.Checkbutton(nt, text='with a sound', variable=self.notify_sound).pack(side='left', padx=(10, 0))
+        ttk.Checkbutton(nt, text='Minimize to the tray', variable=self.tray_on_minimize).pack(side='left',
+                                                                                              padx=(10, 0))
 
         # -- Output
         out = ttk.LabelFrame(root, text='Output', padding=8)
@@ -2498,17 +3149,19 @@ class App(tk.Tk):
         self.suno_id = tk.BooleanVar()
         ttk.Checkbutton(out, text='Add song ID to Suno names', variable=self.suno_id).grid(
             row=2, column=2, columnspan=2, sticky='w', padx=(4, 0))
-        ttk.Label(out, text='Extra arguments').grid(row=3, column=0, sticky='w')
-        ttk.Entry(out, textvariable=self.extra_args).grid(row=3, column=1, sticky='ew', padx=6)
-        ttk.Button(out, text='Pick…', command=self._pick_args).grid(row=3, column=2, sticky='ew')
-        ttk.Button(out, text='Show command', command=self._show_cmd).grid(row=3, column=3, sticky='ew', padx=(4, 0))
+        self.lbl_example = ttk.Label(out, text='', style='Hint.TLabel')
+        self.lbl_example.grid(row=3, column=1, columnspan=3, sticky='w', padx=6, pady=(0, 4))
+        ttk.Label(out, text='Extra arguments').grid(row=4, column=0, sticky='w')
+        ttk.Entry(out, textvariable=self.extra_args).grid(row=4, column=1, sticky='ew', padx=6)
+        ttk.Button(out, text='Pick…', command=self._pick_args).grid(row=4, column=2, sticky='ew')
+        ttk.Button(out, text='Show command', command=self._show_cmd).grid(row=4, column=3, sticky='ew', padx=(4, 0))
         self.clip_start = tk.StringVar()
         self.clip_end = tk.StringVar()
         self.clip_precise = tk.BooleanVar()
         self.lbl_clip = ttk.Label(out, text='Clip section')
-        self.lbl_clip.grid(row=4, column=0, sticky='w', pady=(4, 0))
+        self.lbl_clip.grid(row=5, column=0, sticky='w', pady=(4, 0))
         cf = ttk.Frame(out)
-        cf.grid(row=4, column=1, columnspan=3, sticky='w', padx=6, pady=(4, 0))
+        cf.grid(row=5, column=1, columnspan=3, sticky='w', padx=6, pady=(4, 0))
         ttk.Button(cf, text='Preview…', command=self._open_preview).pack(side='left', padx=(0, 10))
         ttk.Label(cf, text='Start').pack(side='left')
         ttk.Entry(cf, textvariable=self.clip_start, width=9).pack(side='left', padx=(4, 10))
@@ -2643,6 +3296,20 @@ class App(tk.Tk):
             pass
 
     # ---------- actions ----------
+    def _schedule_example(self):
+        if self._example_job:
+            self.after_cancel(self._example_job)
+        self._example_job = self.after(250, self._update_example)  # once typing pauses
+
+    def _update_example(self):
+        self._example_job = None
+        s = self._collect()
+        name = example_filename(s)
+        note = ''
+        if s.get('suno_id', True) and '%(id)s' not in (s['template'] or ''):
+            note = '   ·   Suno songs also get their ID, e.g. [4f85f050]'
+        self.lbl_example.configure(text=f'Example: {name}{note}')
+
     def _on_mode(self):
         video = self.mode.get() == 'video'
         for w in (self.cb_quality, self.cb_container):
@@ -2683,6 +3350,8 @@ class App(tk.Tk):
     def _remove_urls(self, urls):
         """Take these links out of the URL box, leaving everything else (and anything added meanwhile)."""
         gone = set(urls)
+        for u in gone:
+            self.format_overrides.pop(u, None)
         lines = self.url_text.get('1.0', 'end-1c').splitlines()
         keep = [l for l in lines if l.strip() not in gone]
         removed = len(lines) - len(keep)
@@ -2691,6 +3360,7 @@ class App(tk.Tk):
                 keep.pop()
             self.url_text.delete('1.0', 'end')
             self.url_text.insert('1.0', '\n'.join(keep))
+        self._show_overrides()
         return removed
 
     def _urls(self):
@@ -2766,8 +3436,18 @@ class App(tk.Tk):
             n = 1
         self._overall_total = 0
         self._skipped = 0
+        self._bot_hits = 0
+        if s.get('go_easy_youtube', True) and has_youtube(urls):
+            args = args + GO_EASY_ARGS
+            if args_whole:
+                args_whole = args_whole + GO_EASY_ARGS
+            if n > GO_EASY_MAX_PARALLEL:
+                n = GO_EASY_MAX_PARALLEL
+            self._log(f'Go easy on YouTube: pausing 3–8 s between YouTube downloads, at most '
+                      f'{GO_EASY_MAX_PARALLEL} at a time (turn off under Options)')
         self.worker = Worker(urls, args, self.q, parallel=n, args_whole=args_whole, clip_confirmed=clip_confirmed,
-                             clean_on_cancel=s.get('clean_on_cancel', True))
+                             clean_on_cancel=s.get('clean_on_cancel', True),
+                             format_overrides={u: f for u, f in self.format_overrides.items() if u in urls})
         self.worker.start()
 
     def _ask_clip_many(self, what, clip):
@@ -2781,6 +3461,32 @@ class App(tk.Tk):
             'No  —  download every item whole (ignore the clip this time)\n'
             'Cancel  —  stop and change the settings',
             icon='warning', default='no', parent=self)
+
+    def _explain_bot_check(self):
+        n, self._bot_hits = self._bot_hits, 0
+        retry = bool(self.row_jobs)
+        if self.cookies_browser.get() == 'firefox':
+            messagebox.showwarning(
+                'YouTube wants a sign-in', f'YouTube blocked {n} download(s) with its "confirm you\'re not a bot" '
+                'check, even though Grabbit is already using Firefox\'s sign-in.\n\n'
+                '• Open Firefox and make sure you are signed in to YouTube (visit youtube.com once)\n'
+                '• Keep "Go easy on YouTube" on, and try fewer at a time\n'
+                '• Then use Retry failed', parent=self)
+            return
+        answer = messagebox.askyesno(
+            'YouTube wants a sign-in',
+            f'YouTube blocked {n} download(s) with its "confirm you\'re not a bot" check.\n\n'
+            'The fix is to let Grabbit use your YouTube sign-in from Firefox (Chrome and Edge lock their '
+            'sign-ins away from other programs). You need Firefox installed and signed in to YouTube.\n\n'
+            f'Switch "Cookies from browser" to Firefox{" and retry the blocked items now" if retry else ""}?',
+            parent=self)
+        if answer:
+            self.cookies_browser.set('firefox')
+            self.go_easy_youtube.set(True)
+            self._save_settings()
+            self._log('Switched "Cookies from browser" to firefox and turned on "Go easy on YouTube".')
+            if retry:
+                self._retry_failed()
 
     def _cancel(self):
         if self.worker and self.worker.is_alive():
@@ -2828,8 +3534,22 @@ class App(tk.Tk):
             except OSError as e:
                 messagebox.showerror(APP_NAME, f'Could not clear the history:\n{e}', parent=self)
 
+    def _failed_rows(self):
+        """Rows that failed (not ones you cancelled yourself)."""
+        return [i for i in self.row_jobs if self.tree.exists(i) and self.tree.set(i, 'status') == 'Error']
+
     def _retry_failed(self):
-        self._retry(list(self.row_jobs))
+        self._retry(self._failed_rows())
+
+    def _cancel_rows(self, iids):
+        if not self._busy():
+            return
+        keys = {v: k for k, v in self.rows.items()}
+        for iid in iids:
+            key = keys.get(iid)
+            if key:
+                self.worker.cancel_item(key)
+                self.tree.set(iid, 'status', 'Cancelling…')
 
     def _remove_rows(self, iids):
         busy = self._busy()
@@ -2843,7 +3563,7 @@ class App(tk.Tk):
             for k, v in list(self.rows.items()):
                 if v == iid:
                     del self.rows[k]
-        self.btn_retry.configure(state='normal' if self.row_jobs and not busy else 'disabled')
+        self.btn_retry.configure(state='normal' if self._failed_rows() and not busy else 'disabled')
 
     def _show_in_folder(self, path):
         if sys.platform.startswith('win'):
@@ -2885,6 +3605,10 @@ class App(tk.Tk):
         m.add_separator()
         m.add_command(label=f'Retry ({len(failed)})' if many else 'Retry', command=lambda: self._retry(failed),
                       state='normal' if failed and not self._busy() else 'disabled')
+        active = [i for i in sel if self._busy() and self.tree.set(i, 'status') in
+                  ('Queued', 'Starting', 'Downloading', 'Downloaded') or self.tree.set(i, 'status').startswith('Processing')]
+        m.add_command(label=f'Cancel download ({len(active)})' if many else 'Cancel download',
+                      command=lambda: self._cancel_rows(active), state='normal' if active else 'disabled')
         m.add_command(label='Remove from list', command=lambda: self._remove_rows(sel))
         try:
             m.tk_popup(e.x_root, e.y_root)
@@ -2901,10 +3625,90 @@ class App(tk.Tk):
     def _on_close(self):
         self._save_settings()
         if self.worker and self.worker.is_alive():
+            if self.state() == 'withdrawn':
+                self._show_from_tray()
             if not messagebox.askyesno(APP_NAME, 'A download is running. Cancel it and quit?'):
                 return
             self.worker.cancel.set()
+        self.tray.stop()
         self.destroy()
+
+    # ---------- tray and notifications ----------
+    def _on_unmap(self, e):
+        if e.widget is self and self.tray_on_minimize.get():
+            self.after(50, self._maybe_hide_to_tray)
+
+    def _maybe_hide_to_tray(self):
+        if self.state() == 'iconic' and self.tray.ensure():
+            self.withdraw()
+            if not getattr(self, '_tray_tip_shown', False):
+                self._tray_tip_shown = True
+                self.tray.notify(APP_NAME, f'{APP_NAME} is still here — click the bunny in the tray to bring it back.')
+
+    def _show_from_tray(self):
+        self.deiconify()
+        self.state('normal')
+        self.lift()
+        try:
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def _away(self):
+        """True when the user isn't looking at Grabbit (minimized, in the tray, or another app in front)."""
+        try:
+            return self.state() in ('iconic', 'withdrawn') or self.focus_displayed() is None
+        except (tk.TclError, KeyError):
+            return True
+
+    def _notify_finished(self, ok):
+        if ok is None or not self.notify_done.get():
+            return
+        if self.notify_sound.get():
+            play_done_sound()
+        if not self._away():
+            return
+        done = sum(1 for iid in self.rows.values() if self.tree.set(iid, 'status') == '✔ Done')
+        failed = len(self._failed_rows())
+        if failed:
+            msg = f'{done} downloaded, {failed} failed — open {APP_NAME} to retry.'
+        elif done:
+            msg = f'{done} download{"s" if done != 1 else ""} finished.'
+        else:
+            msg = 'Nothing new to download.' if self._skipped else 'Finished.'
+        if self._skipped:
+            msg += f' {self._skipped} skipped.'
+        self.tray.notify(f'{APP_NAME} — done', msg)
+
+    def _link_at_cursor(self):
+        urls = self._urls()
+        if not urls:
+            return None
+        try:  # prefer the line the text cursor is on
+            line = self.url_text.get('insert linestart', 'insert lineend').strip()
+            if line in urls:
+                return line
+        except tk.TclError:
+            pass
+        return urls[0]
+
+    def _open_formats(self):
+        url = self._link_at_cursor()
+        if not url:
+            messagebox.showinfo(APP_NAME, 'Paste a link first (click on its line to pick it), then click Formats.',
+                                parent=self)
+            return
+        FormatsWindow(self, url)
+
+    def _show_overrides(self):
+        n = len([u for u in self.format_overrides if u in set(self._urls())])
+        self.lbl_overrides.configure(text=f'Exact quality set for {n} link{"s" if n != 1 else ""}  ✕' if n else '')
+
+    def _clear_overrides(self):
+        if self.format_overrides and messagebox.askyesno(
+                APP_NAME, 'Go back to automatic quality for every link?', parent=self):
+            self.format_overrides.clear()
+            self._show_overrides()
 
     def _open_preview(self):
         urls = self._urls()
@@ -2922,6 +3726,19 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, 'Previews need FFmpeg, which was not found next to the app.', parent=self)
             return
         PreviewWindow(self, url)
+
+    def _open_search(self):
+        q, site = self.search_query.get().strip(), self.search_site.get()
+        w = self._search_win
+        if w is not None and w.winfo_exists():
+            w.deiconify()
+            w.lift()
+            if q:
+                w.query.set(q)
+                w.site.set(site)
+                w.search()
+            return
+        self._search_win = SearchWindow(self, q, site)
 
     # ---------- adding links: clipboard watching and drag-and-drop ----------
     def _add_urls(self, urls, source):
@@ -2979,7 +3796,7 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
         if ok:
-            self._first_section.configure(
+            self._url_section.configure(
                 text='URLs (one per line — videos, playlists or channels; you can also drag links here)')
         return ok
 
@@ -3224,16 +4041,31 @@ class App(tk.Tk):
                     iid = self.rows.get(data['key'])
                     if iid and self.tree.set(iid, 'status') == 'Queued':
                         self.tree.set(iid, 'status', 'In batch already')
+                elif kind == 'item_cancelled':
+                    iid = self.rows.get(data['key']) if data.get('key') else None
+                    if iid:
+                        self.tree.set(iid, 'status', 'Cancelled')
+                        for col in ('speed', 'eta'):
+                            self.tree.set(iid, col, '')
+                        self.tree.item(iid, tags=('skip',))
+                        self.row_jobs[iid] = data['job']  # can be brought back with Retry
+                elif kind == 'bot_check':
+                    self._bot_hits += 1
                 elif kind == 'urls_done':
                     if self.clear_done.get() and data['done']:
                         n = self._remove_urls(data['done'])
                         if n:
                             self._log(f'Cleared {n} finished link(s) from the list'
                                       + (f"; {len(data['failed'])} with failures kept" if data['failed'] else ''))
+                elif kind == 'tray':
+                    if data == 'show':
+                        self._show_from_tray()
+                    elif data == 'quit':
+                        self._on_close()
                 elif kind == 'finished':
                     self.btn_go.configure(state='normal')
                     self.btn_cancel.configure(state='disabled')
-                    self.btn_retry.configure(state='normal' if self.row_jobs else 'disabled')
+                    self.btn_retry.configure(state='normal' if self._failed_rows() else 'disabled')
                     secs = int(time.time() - getattr(self, '_started', time.time()))
                     if data is None:
                         self.status.set('Cancelled')
@@ -3241,10 +4073,13 @@ class App(tk.Tk):
                         self.status.set(f'Finished in {human_eta(secs)}'
                                         + (f' — {self._skipped} skipped (see log)' if self._skipped else ''))
                         self.progress['value'] = 100
-                    elif self.row_jobs:
-                        self.status.set(f'Finished — {len(self.row_jobs)} failed (right-click or Retry failed)')
+                    elif self._failed_rows():
+                        self.status.set(f'Finished — {len(self._failed_rows())} failed (right-click or Retry failed)')
                     else:
                         self.status.set('Finished with errors — see log')
+                    if self._bot_hits and data is not None:
+                        self.after(300, self._explain_bot_check)
+                    self.after(200, lambda ok=data: self._notify_finished(ok))
                     if self._skipped:
                         self._log(f'{self._skipped} item(s) were skipped because you already have them '
                                   '(file in the folder, or in your download history).')

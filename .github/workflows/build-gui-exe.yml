@@ -26,7 +26,7 @@ jobs:
       - name: Install yt-dlp, dependencies, Deno and PyInstaller
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --upgrade "yt-dlp[default,deno,curl-cffi]" tkinterdnd2 pyinstaller
+          python -m pip install --upgrade "yt-dlp[default,deno,curl-cffi]" tkinterdnd2 pillow pystray pyinstaller
 
       - name: Check whether anything changed since the last release
         id: check
@@ -77,7 +77,7 @@ jobs:
           --name "Grabbit" --icon "${{ github.workspace }}/assets/grabbit.ico"
           --add-data "${{ github.workspace }}/assets;assets"
           --distpath App --workpath .build --specpath .build
-          --paths . --hidden-import _build_info --collect-all tkinterdnd2
+          --paths . --hidden-import _build_info --hidden-import pystray._win32 --collect-all tkinterdnd2
           ytdlp_gui.py
 
       - name: Add Deno and FFmpeg next to the .exe
