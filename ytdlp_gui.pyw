@@ -161,11 +161,9 @@ def suno_token(ie):
 _SUNO_STUDIO = ('https://studio-api.prod.suno.com', 'https://studio-api-prod.suno.com')
 
 
-def suno_api(ie, path, vid, note, token=None, query=None, json_body=None):
-    """Call Suno's studio API (logged in if token is given), trying both of its host names. None on failure."""
+def _suno_headers(ydl, token=None):
     import base64
     import uuid
-    ydl = ie._downloader
     h = dict(_SUNO_HEADERS)
     if token:
         if not getattr(ydl, '_suno_device', None):
@@ -174,16 +172,72 @@ def suno_api(ie, path, vid, note, token=None, query=None, json_body=None):
         stamp = base64.b64encode(json.dumps({'timestamp': int(time.time() * 1000)}).encode()).decode()
         h.update({'Authorization': f'Bearer {token}', 'device-id': ydl._suno_device.strip('"%22'),
                   'browser-token': json.dumps({'token': stamp})})
+    return h
+
+
+def suno_api(ie, path, vid, note, token=None, query=None, json_body=None, hosts=None, accept=None):
+    """Call Suno's studio API (logged in if token is given), trying each of its host names until one gives an
+    answer (that `accept` likes, if given). None on failure."""
+    h = _suno_headers(ie._downloader, token)
     data = None
     if json_body is not None:
         data = json.dumps(json_body).encode()
         h['Content-Type'] = 'application/json'
     step = path.strip('/').split('/')[1] + (' (logged in)' if token else '')
-    for host in _SUNO_STUDIO:
+    ie._suno_rejected = None  # an answer `accept` turned down, in case the caller still wants it
+    for host in hosts or _SUNO_STUDIO:
         res = _suno_json(ie, f'{host}{path}', note, step, query=query, data=data, headers=h)
         if res and not (isinstance(res, dict) and res.get('detail') and len(res) == 1):
-            return res
+            if accept is None or accept(res):
+                return res
+            ie._suno_rejected = ie._suno_rejected or res
     return None
+
+
+def _http_urls(obj):
+    """Every http(s) link anywhere inside a JSON answer."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop(0)
+        if isinstance(cur, dict):
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+        elif isinstance(cur, str) and cur.startswith('http'):
+            yield cur
+
+
+def suno_download_link(ie, song_id, token, fmt='mp3'):
+    """Ask Suno for a download link the way its Download button does. (url, extra headers) or (None, None)."""
+    ydl = ie._downloader
+    trail = ydl.__dict__.setdefault('_suno_trail', [])
+    for host in reversed(_SUNO_STUDIO):
+        url = f'{host}/api/download/clip/{song_id}'
+        h = _suno_headers(ydl, token)
+        try:
+            urlh = ie._request_webpage(url, song_id, f'Asking Suno for a download link ({fmt})', query={'format': fmt},
+                                       headers=h, expected_status=lambda _: True, impersonate=True)
+        except Exception as e:
+            trail.append(f'download button ({host[8:].split(".")[0]}): {str(e).split(": ", 1)[-1][:60]}')
+            continue
+        ctype = (urlh.headers.get('Content-Type') or '').lower()
+        if urlh.status < 400 and ('audio' in ctype or 'octet-stream' in ctype or 'video' in ctype):
+            final = urlh.url
+            urlh.close()
+            # if Suno streamed the file itself, the download needs the same login headers
+            return final, (h if 'suno.com/api/' in final else {})
+        body = urlh.read(200_000).decode('utf-8', 'replace')
+        urlh.close()
+        try:
+            res = json.loads(body)
+        except ValueError:
+            res = None
+        link = next((u for u in _http_urls(res) if 'forbidden' not in u), None) if urlh.status < 400 else None
+        if link:
+            return link, {}
+        trail.append(f'download button ({host[8:].split(".")[0]}): HTTP {urlh.status}'
+                     + (f' {str(res.get("detail"))[:60]}' if isinstance(res, dict) and res.get('detail') else ''))
+    return None, None
 
 
 class SunoIE(InfoExtractor):
@@ -216,17 +270,33 @@ class SunoIE(InfoExtractor):
             # unpublished songs only show their details to the owner: ask again logged in, if we can
             token = suno_token(self)
             if token:
-                got = (suno_api(self, f'/api/clip/{song_id}', song_id, 'Downloading song info (logged in)', token)
-                       or {})
-                if not playable(got):
-                    feed = suno_api(self, '/api/feed/v2', song_id, 'Looking the song up in your library', token,
-                                    query={'ids': song_id})
-                    got = next((c for c in ((feed or {}).get('clips') if isinstance(feed, dict) else feed) or []
-                                if isinstance(c, dict) and c.get('id') == song_id and playable(c)), got)
-                if got and not playable(got):
+                def pick(res):
+                    items = [res] if isinstance(res, dict) and res.get('id') else (
+                        (res.get('clips') if isinstance(res, dict) else res) or [])
+                    return next((c for c in items if isinstance(c, dict) and c.get('id') == song_id), None)
+
+                got, found = None, None
+                for path, note, query in ((f'/api/clip/{song_id}', 'Downloading song info (logged in)', None),
+                                          ('/api/feed/v2', 'Looking the song up in your library', {'ids': song_id}),
+                                          ('/api/feed/', 'Looking the song up in your library', {'ids': song_id})):
+                    res = suno_api(self, path, song_id, note, token, query=query,
+                                   accept=lambda r: bool(pick(r) and playable(pick(r))))
+                    got = pick(res) if res else None
+                    if got:
+                        break
+                    if not found and self._suno_rejected:  # keep the details even without audio (title, artist…)
+                        found = pick(self._suno_rejected)
+                if not got and found:
                     self._downloader._suno_trail.append(
-                        f'found the song ({got.get("status") or "no status"}) but no audio link')
-                clip = got if got.get('title') else clip
+                        f'found the song ({found.get("status") or "no status"}) but its audio link was '
+                        + (('blocked' if 'forbidden' in found['audio_url'] else 'unusable') if found.get('audio_url')
+                           else 'missing'))
+                got = got or found or {}
+                if not playable(got):
+                    link, link_headers = suno_download_link(self, song_id, token)
+                    if link:
+                        got = {**got, 'audio_url': link, '_headers': link_headers}
+                clip = got if got.get('title') or playable(got) else clip
         meta = clip.get('metadata') or {}
 
         formats = []
@@ -235,8 +305,8 @@ class SunoIE(InfoExtractor):
             audio = None
         for a in dict.fromkeys(filter(None, (audio, f'https://cdn1.suno.ai/{song_id}.mp3'))):
             if (private and a == audio) or self._is_valid_url(a, song_id, 'MP3 audio'):
-                formats.append({'format_id': 'mp3', 'url': a, 'ext': 'mp3',
-                                'vcodec': 'none', 'acodec': 'mp3', 'quality': 1})
+                formats.append({'format_id': 'mp3', 'url': a, 'ext': 'mp3', 'vcodec': 'none', 'acodec': 'mp3',
+                                'quality': 1, 'http_headers': clip.get('_headers') or {}})
                 break
             self._downloader.__dict__.setdefault('_suno_trail', []).append(
                 f'audio file {a.split("/")[2]}: not available')
