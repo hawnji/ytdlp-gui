@@ -620,9 +620,15 @@ def download_update(info, workdir, progress=None, cancel=None):
 
 def write_updater_script(src, dst, exe_name, pids, workdir):
     """Batch file that waits for the app to close, copies the new files over it and restarts it."""
+    # wait up to ~30 s for the app to close by itself, then make sure it's gone so its files can be replaced
     waits = '\r\n'.join(
+        f'set /a n{i}=0\r\n'
         f':wait{i}\r\ntasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
-        f'if not errorlevel 1 ( ping -n 2 127.0.0.1 >nul & goto wait{i} )'
+        f'if errorlevel 1 goto done{i}\r\n'
+        f'set /a n{i}+=1\r\n'
+        f'if %n{i}% GEQ 30 ( taskkill /PID {pid} /F >nul 2>&1 & ping -n 3 127.0.0.1 >nul & goto done{i} )\r\n'
+        f'ping -n 2 127.0.0.1 >nul & goto wait{i}\r\n'
+        f':done{i}'
         for i, pid in enumerate(pids))
     script = (
         '@echo off\r\n'
@@ -4147,6 +4153,7 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, f'Could not start the updater:\n{e}', parent=self)
             return
         self._save_settings()
+        self.tray.stop()  # a tray icon left running would keep Grabbit open, and the update could not finish
         self.destroy()
 
     # ---------- queue pump ----------
@@ -4360,4 +4367,13 @@ if __name__ == '__main__':
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Hawnji.Grabbit')
         except Exception:
             pass
-    App().mainloop()
+    app = App()
+    try:
+        app.mainloop()
+    finally:
+        try:
+            app.tray.stop()
+        except Exception:
+            pass
+    # leave right away: nothing (a tray icon, a stuck download thread) may keep the process — and the .exe — alive
+    os._exit(0)
