@@ -43,7 +43,7 @@ jobs:
             $m = [regex]::Match($prevNotes, 'commit:\s*([0-9a-f]{40})')
             if ($m.Success) {
               $changed = git diff --name-only $m.Groups[1].Value '${{ github.sha }}'
-              $appFiles = $changed | Where-Object { $_ -match '^(ytdlp_gui\.pyw?|build_exe\.bat|assets/.*)$' }
+              $appFiles = $changed | Where-Object { $_ -match '^(ytdlp_gui\.py|build_exe\.bat|assets/.*)$' }
               if ($changed -and -not $appFiles) {
                 $skip = 'true'
                 Write-Host "Only non-app files changed since the last release - no new release:"

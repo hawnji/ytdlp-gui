@@ -5,7 +5,7 @@ Grabbit — a desktop downloader built on yt-dlp (videos, music, Suno, clips).
 Drop this file into the root of the yt-dlp source folder (next to the
 `yt_dlp` package) and run it with Python 3.10+:
 
-    python ytdlp_gui.py          (or double-click ytdlp_gui.pyw on Windows)
+    python ytdlp_gui.py          (or double-click Grabbit.bat on Windows)
 
 It also works if yt-dlp is installed with pip.
 FFmpeg is needed for merging best video+audio, audio conversion and embedding.
@@ -245,7 +245,6 @@ class SunoIE(InfoExtractor):
     IE_NAME = 'suno'
     _VALID_URL = r'https?://(?:www\.|app\.)?suno\.com/(?:song|s|embed)/(?P<id>[\w-]+)'
     _UUID_RE = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    _API = 'https://studio-api.prod.suno.com/api/clip/'
 
     def _real_extract(self, url):
         song_id = self._match_id(url)

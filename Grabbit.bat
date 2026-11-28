@@ -1,8 +1,8 @@
 @echo off
 cd /d "%~dp0"
 if exist "App\Grabbit.exe" ( start "" "App\Grabbit.exe" & exit /b )
-where pyw >nul 2>&1 && ( start "" pyw -3 ytdlp_gui.pyw & exit /b )
-where pythonw >nul 2>&1 && ( start "" pythonw ytdlp_gui.pyw & exit /b )
+where pyw >nul 2>&1 && ( start "" pyw -3 ytdlp_gui.py & exit /b )
+where pythonw >nul 2>&1 && ( start "" pythonw ytdlp_gui.py & exit /b )
 echo.
 echo  Python is not installed (or not on PATH), so Grabbit can't start from source.
 echo.
