@@ -1,9 +1,9 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title Building yt-dlp GUI.exe
+title Building Grabbit.exe
 echo.
-echo  ===  yt-dlp GUI  -  .exe builder  ===
+echo  ===  Grabbit  -  .exe builder  ===
 echo.
 
 rem ---- Find Python 3.11+ ----
@@ -28,7 +28,7 @@ echo [2/4] Installing yt-dlp, its dependencies, Deno, curl_cffi and PyInstaller.
 
 echo [3/4] Building the .exe (this takes a minute or two)...
 "%VPY%" -m PyInstaller --noconfirm --clean --onefile --windowed ^
-  --name "yt-dlp GUI" --distpath "App" --workpath ".build" --specpath ".build" --collect-all tkinterdnd2 ^
+  --name "Grabbit" --icon "%~dp0assets\grabbit.ico" --add-data "%~dp0assets\grabbit.png;assets" --add-data "%~dp0assets\grabbit.ico;assets" --distpath "App" --workpath ".build" --specpath ".build" --collect-all tkinterdnd2 ^
   "%~dp0ytdlp_gui.py" || goto :fail
 
 echo [4/4] Putting FFmpeg and Deno next to the .exe...
@@ -53,7 +53,7 @@ for /r ".build\ff" %%F in (ffmpeg.exe ffprobe.exe) do if exist "%%F" copy /y "%%
 
 echo.
 echo  Done!  Your app is in the "App" folder:
-echo     App\yt-dlp GUI.exe
+echo     App\Grabbit.exe
 echo  Keep ffmpeg.exe, ffprobe.exe and deno.exe in the same folder as the .exe.
 echo  You can move the whole App folder anywhere and make a shortcut to the .exe.
 echo.

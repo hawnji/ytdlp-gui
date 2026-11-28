@@ -1,4 +1,4 @@
-name: Build yt-dlp GUI.exe
+name: Build Grabbit
 
 on:
   push:
@@ -43,7 +43,7 @@ jobs:
             $m = [regex]::Match($prevNotes, 'commit:\s*([0-9a-f]{40})')
             if ($m.Success) {
               $changed = git diff --name-only $m.Groups[1].Value '${{ github.sha }}'
-              $appFiles = $changed | Where-Object { $_ -match '^(ytdlp_gui\.pyw?|build_exe\.bat)$' }
+              $appFiles = $changed | Where-Object { $_ -match '^(ytdlp_gui\.pyw?|build_exe\.bat|assets/.*)$' }
               if ($changed -and -not $appFiles) {
                 $skip = 'true'
                 Write-Host "Only non-app files changed since the last release - no new release:"
@@ -74,7 +74,10 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: >
           python -m PyInstaller --noconfirm --clean --onefile --windowed
-          --name "yt-dlp GUI" --distpath App --workpath .build --specpath .build
+          --name "Grabbit" --icon "${{ github.workspace }}/assets/grabbit.ico"
+          --add-data "${{ github.workspace }}/assets/grabbit.png;assets"
+          --add-data "${{ github.workspace }}/assets/grabbit.ico;assets"
+          --distpath App --workpath .build --specpath .build
           --paths . --hidden-import _build_info --collect-all tkinterdnd2
           ytdlp_gui.py
 
@@ -90,10 +93,20 @@ jobs:
           Get-ChildItem ff -Recurse -Include ffmpeg.exe,ffprobe.exe | Copy-Item -Destination App\
           Get-ChildItem App
 
+      - name: Keep the old app name working for existing installs
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        # Installs from before the rename update and restart "yt-dlp GUI.exe"; this copy of the new app
+        # simply opens Grabbit.exe, so old shortcuts and old updaters keep working.
+        run: Copy-Item App\Grabbit.exe "App\yt-dlp GUI.exe"
+
       - name: Zip it
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
-        run: Compress-Archive -Path App\* -DestinationPath "yt-dlp-GUI-windows.zip"
+        run: |
+          Compress-Archive -Path App\* -DestinationPath "Grabbit-windows.zip"
+          # same package under the old name, which app versions from before the rename look for
+          Copy-Item "Grabbit-windows.zip" "yt-dlp-GUI-windows.zip"
 
       - name: Add patch notes to older releases that don't have any
         if: steps.check.outputs.skip != 'true'
@@ -120,4 +133,4 @@ jobs:
         run: |
           $n = [int]"${{ github.run_number }}"
           $tag = 'build-{0:D4}' -f $n
-          gh release create $tag "yt-dlp-GUI-windows.zip" --target "${{ github.sha }}" --title "yt-dlp GUI (build $n)" --notes-file notes.md --latest
+          gh release create $tag "Grabbit-windows.zip" "yt-dlp-GUI-windows.zip" --target "${{ github.sha }}" --title "Grabbit (build $n)" --notes-file notes.md --latest

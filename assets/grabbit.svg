@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#262624"/>
+  <!-- ears -->
+  <ellipse cx="96" cy="78" rx="24" ry="64" transform="rotate(-14 96 78)" fill="#ece9e0"/>
+  <ellipse cx="160" cy="78" rx="24" ry="64" transform="rotate(14 160 78)" fill="#ece9e0"/>
+  <ellipse cx="96" cy="82" rx="11" ry="44" transform="rotate(-14 96 82)" fill="#d97757"/>
+  <ellipse cx="160" cy="82" rx="11" ry="44" transform="rotate(14 160 82)" fill="#d97757"/>
+  <!-- head -->
+  <ellipse cx="128" cy="160" rx="74" ry="62" fill="#ece9e0"/>
+  <!-- eyes -->
+  <circle cx="102" cy="150" r="9" fill="#262624"/><circle cx="154" cy="150" r="9" fill="#262624"/>
+  <circle cx="105" cy="147" r="3" fill="#ffffff"/><circle cx="157" cy="147" r="3" fill="#ffffff"/>
+  <!-- download-arrow nose -->
+  <path d="M128 192 L112 172 H122 V160 H134 V172 H144 Z" fill="#d97757"/>
+</svg>

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-yt-dlp GUI — a desktop front end for yt-dlp.
+Grabbit — a desktop downloader built on yt-dlp (videos, music, Suno, clips).
 
 Drop this file into the root of the yt-dlp source folder (next to the
 `yt_dlp` package) and run it with Python 3.10+:
@@ -354,9 +354,12 @@ def urls_from_drop(paths_or_text, splitlist=None):
     return find_urls(paths_or_text)
 
 
-APP_NAME = 'yt-dlp GUI'
+APP_NAME = 'Grabbit'
+EXE_NAME = 'Grabbit.exe'
+LEGACY_EXE = 'yt-dlp GUI.exe'  # the app's name before it became Grabbit; still handled for old installs
 UPDATE_REPO = 'hawnji/ytdlp-gui'
-UPDATE_ASSET = 'yt-dlp-GUI-windows.zip'
+UPDATE_ASSETS = ('Grabbit-windows.zip', 'yt-dlp-GUI-windows.zip')  # new name first, old one as a fallback
+RES_DIR = getattr(sys, '_MEIPASS', HERE)  # where bundled files (the icon) live
 try:
     from _build_info import BUILD, BUILT_YTDLP  # written by the GitHub build
 except ImportError:
@@ -381,12 +384,13 @@ def fetch_latest_release(timeout=15):
     with urllib.request.urlopen(req, timeout=timeout, context=_https_context()) as r:
         rel = json.load(r)
     m = re.fullmatch(r'build-(\d+)', rel.get('tag_name') or '')
-    asset = next((a for a in rel.get('assets') or [] if a.get('name') == UPDATE_ASSET), None)
+    assets = {a.get('name'): a for a in rel.get('assets') or []}
+    asset = next((assets[n] for n in UPDATE_ASSETS if n in assets), None)
     if not m or not asset:
         return None
     ver = re.search(r'yt-dlp:\s*(\S+)', rel.get('body') or '')
     return {'build': int(m.group(1)), 'ytdlp': ver.group(1) if ver else None,
-            'url': asset['browser_download_url'], 'size': asset.get('size') or 0,
+            'url': asset['browser_download_url'], 'size': asset.get('size') or 0, 'name': asset['name'],
             'page': rel.get('html_url')}
 
 
@@ -396,7 +400,7 @@ def download_update(info, workdir, progress=None, cancel=None):
     import zipfile
     shutil.rmtree(workdir, ignore_errors=True)
     os.makedirs(workdir)
-    zpath = os.path.join(workdir, UPDATE_ASSET)
+    zpath = os.path.join(workdir, info.get('name') or UPDATE_ASSETS[0])
     req = urllib.request.Request(info['url'], headers={'User-Agent': APP_NAME})
     with urllib.request.urlopen(req, timeout=60, context=_https_context()) as r, open(zpath, 'wb') as f:
         total = int(r.headers.get('Content-Length') or info.get('size') or 0)
@@ -415,12 +419,14 @@ def download_update(info, workdir, progress=None, cancel=None):
     with zipfile.ZipFile(zpath) as z:
         z.extractall(new)
     # the zip holds the app's files at its root (or inside one folder)
-    if not os.path.exists(os.path.join(new, 'yt-dlp GUI.exe')):
+    def has_app(d):
+        return any(os.path.exists(os.path.join(d, n)) for n in (EXE_NAME, LEGACY_EXE))
+    if not has_app(new):
         subs = [os.path.join(new, d) for d in os.listdir(new) if os.path.isdir(os.path.join(new, d))]
-        if len(subs) == 1 and os.path.exists(os.path.join(subs[0], 'yt-dlp GUI.exe')):
+        if len(subs) == 1 and has_app(subs[0]):
             new = subs[0]
         else:
-            raise RuntimeError('The update package does not contain yt-dlp GUI.exe')
+            raise RuntimeError(f'The update package does not contain {EXE_NAME}')
     return new
 
 
@@ -432,7 +438,7 @@ def write_updater_script(src, dst, exe_name, pids, workdir):
         for i, pid in enumerate(pids))
     script = (
         '@echo off\r\n'
-        'title Updating yt-dlp GUI...\r\n'
+        f'title Updating {APP_NAME}...\r\n'
         f'{waits}\r\n'
         'ping -n 2 127.0.0.1 >nul\r\n'
         f'robocopy "{src}" "{dst}" /E /R:15 /W:1 /NFL /NDL /NJH /NJS /NP >nul\r\n'
@@ -2107,6 +2113,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f'{APP_NAME}' + (f'  (build {BUILD})' if BUILD else '') + f'  —  yt-dlp {YTDLP_VERSION}')
+        self._set_icon()
         self._updating = False
         self.geometry('980x720')
         self.minsize(820, 600)
@@ -2138,6 +2145,20 @@ class App(tk.Tk):
                       'limited or fail. Install Deno from https://deno.land')
 
     # ---------- look ----------
+    def _set_icon(self):
+        for d in (RES_DIR, HERE):
+            png = os.path.join(d, 'assets', 'grabbit.png')
+            if os.path.exists(png):
+                try:
+                    self._icon_img = tk.PhotoImage(file=png)
+                    self.iconphoto(True, self._icon_img)  # True: also for every other window
+                    ico = os.path.join(d, 'assets', 'grabbit.ico')
+                    if sys.platform.startswith('win') and os.path.exists(ico):
+                        self.iconbitmap(default=ico)
+                except tk.TclError:
+                    pass
+                return
+
     def _style(self):
         st = ttk.Style(self)
         st.theme_use('clam')  # the only built-in theme that can be fully recoloured
@@ -3158,11 +3179,31 @@ class App(tk.Tk):
         self.after(100, self._poll)
 
 
+def _hand_over_to_new_name():
+    """Started as the old 'yt-dlp GUI.exe' (old shortcuts, old updaters)? Open Grabbit.exe instead."""
+    if not FROZEN or os.path.basename(sys.executable).lower() != LEGACY_EXE.lower():
+        return False
+    target = os.path.join(HERE, EXE_NAME)
+    if not os.path.exists(target):
+        return False
+    env = {k: v for k, v in os.environ.items() if not k.startswith(('_PYI_', '_MEIPASS'))}
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    try:
+        subprocess.Popen([target], cwd=HERE, env=env, close_fds=True, creationflags=0x00000200)
+        return True
+    except Exception:
+        return False
+
+
 if __name__ == '__main__':
+    if _hand_over_to_new_name():
+        sys.exit(0)
     if sys.platform.startswith('win'):
         try:
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            # own taskbar identity, so Windows shows Grabbit's icon rather than Python's
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Hawnji.Grabbit')
         except Exception:
             pass
     App().mainloop()
