@@ -10,7 +10,7 @@ A desktop downloader for Windows built on [yt-dlp](https://github.com/yt-dlp/yt-
 - Clipboard watching, drag and drop, dark mode, automatic updates
 
 ## Get it
-Download **Grabbit-windows.zip** from the [Releases](../../releases/latest) page, unblock it (right-click → Properties → Unblock), unzip it and run **Grabbit.exe**. Keep `ffmpeg.exe`, `ffprobe.exe` and `deno.exe` next to it.
+Download **Grabbit-windows.zip** from the [Releases](../../releases/latest) page, unzip it and run **Grabbit.exe**. Keep `ffmpeg.exe`, `ffprobe.exe` and `deno.exe` next to it.
 
 Every release lists what changed. The app updates itself from inside (**Update now**), and a new build with the latest yt-dlp is made every week.
 
