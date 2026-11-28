@@ -75,8 +75,7 @@ jobs:
         run: >
           python -m PyInstaller --noconfirm --clean --onefile --windowed
           --name "Grabbit" --icon "${{ github.workspace }}/assets/grabbit.ico"
-          --add-data "${{ github.workspace }}/assets/grabbit.png;assets"
-          --add-data "${{ github.workspace }}/assets/grabbit.ico;assets"
+          --add-data "${{ github.workspace }}/assets;assets"
           --distpath App --workpath .build --specpath .build
           --paths . --hidden-import _build_info --collect-all tkinterdnd2
           ytdlp_gui.py

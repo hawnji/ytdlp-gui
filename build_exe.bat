@@ -28,7 +28,7 @@ echo [2/4] Installing yt-dlp, its dependencies, Deno, curl_cffi and PyInstaller.
 
 echo [3/4] Building the .exe (this takes a minute or two)...
 "%VPY%" -m PyInstaller --noconfirm --clean --onefile --windowed ^
-  --name "Grabbit" --icon "%~dp0assets\grabbit.ico" --add-data "%~dp0assets\grabbit.png;assets" --add-data "%~dp0assets\grabbit.ico;assets" --distpath "App" --workpath ".build" --specpath ".build" --collect-all tkinterdnd2 ^
+  --name "Grabbit" --icon "%~dp0assets\grabbit.ico" --add-data "%~dp0assets;assets" --distpath "App" --workpath ".build" --specpath ".build" --collect-all tkinterdnd2 ^
   "%~dp0ytdlp_gui.py" || goto :fail
 
 echo [4/4] Putting FFmpeg and Deno next to the .exe...

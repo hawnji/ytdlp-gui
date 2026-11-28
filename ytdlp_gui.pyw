@@ -2146,18 +2146,28 @@ class App(tk.Tk):
 
     # ---------- look ----------
     def _set_icon(self):
+        # PNGs in several sizes: Windows picks a sharp one for the title bar (16 px) and the taskbar (32-48 px).
+        # (Not the .ico: Tk reads .ico files itself and can't handle the PNG images inside, leaving it blank.)
         for d in (RES_DIR, HERE):
-            png = os.path.join(d, 'assets', 'grabbit.png')
-            if os.path.exists(png):
+            folder = os.path.join(d, 'assets')
+            if not os.path.exists(os.path.join(folder, 'grabbit.png')):
+                continue
+            imgs = []
+            for name in ('grabbit.png', 'grabbit_64.png', 'grabbit_48.png', 'grabbit_32.png',
+                         'grabbit_24.png', 'grabbit_16.png'):
+                path = os.path.join(folder, name)
+                if os.path.exists(path):
+                    try:
+                        imgs.append(tk.PhotoImage(file=path))
+                    except tk.TclError:
+                        pass
+            if imgs:
+                self._icon_imgs = imgs  # keep them alive
                 try:
-                    self._icon_img = tk.PhotoImage(file=png)
-                    self.iconphoto(True, self._icon_img)  # True: also for every other window
-                    ico = os.path.join(d, 'assets', 'grabbit.ico')
-                    if sys.platform.startswith('win') and os.path.exists(ico):
-                        self.iconbitmap(default=ico)
+                    self.iconphoto(True, *imgs)  # True: also for every other window
                 except tk.TclError:
                     pass
-                return
+            return
 
     def _style(self):
         st = ttk.Style(self)
