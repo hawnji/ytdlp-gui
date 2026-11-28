@@ -2,7 +2,7 @@
 
 # Grabbit
 
-A desktop downloader for Windows built on [yt-dlp](https://github.com/yt-dlp/yt-dlp): videos, music and whole playlists from YouTube and well over a thousand other sites, plus Suno songs, playlists, albums and profiles.
+A desktop downloader for Windows built on [yt-dlp](https://github.com/yt-dlp/yt-dlp): videos, music and whole playlists from YouTube and well over a thousand other sites, playlists, albums and profiles.
 
 - Video or audio (MP3, M4A, Opus, FLAC, WAV), with separate folders for each
 - Several downloads at once, retry failed items, only-new-items syncing
