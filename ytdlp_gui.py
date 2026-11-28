@@ -487,6 +487,7 @@ DEFAULTS = {
     'only_new': False,
     'watch_clipboard': False,
     'clear_done': True,
+    'clean_on_cancel': True,
     'suno_id': True,
     'preview_volume': 50.0,
     'clip_precise': True,
@@ -750,8 +751,12 @@ class Worker(threading.Thread):
     """Runs downloads. `jobs` is a list of URLs, or of ('url', url, None) / ('entry', entry, extra) tuples
     (the latter is how failed playlist items are retried with their playlist numbering intact)."""
 
-    def __init__(self, jobs, args, q, parallel=1, args_whole=None, clip_confirmed=False):
+    def __init__(self, jobs, args, q, parallel=1, args_whole=None, clip_confirmed=False, clean_on_cancel=True):
         super().__init__(daemon=True)
+        self.clean_on_cancel = clean_on_cancel
+        self._started_at = time.time()
+        self._touched = {}       # item id -> files yt-dlp wrote for it (partial downloads, pieces, temp files)
+        self._finished = set()   # item ids whose file reached its final place
         # args_whole: the same settings without the clip, used if the user chooses to download a playlist whole
         self.args_whole = args_whole
         self._clip_choice = 'clip' if clip_confirmed else None
@@ -781,11 +786,19 @@ class Worker(threading.Thread):
             self.errors += 1
         self._tl.errors = getattr(self._tl, 'errors', 0) + 1
 
+    def _track(self, key, *paths):
+        paths = [p for p in paths if p]
+        if paths:
+            with self._lock:
+                self._touched.setdefault(key, set()).update(paths)
+
     def _hook(self, d):
-        if self.cancel.is_set():
-            raise DownloadCancelled('Cancelled by user')
         info = d.get('info_dict') or {}
         key = info.get('id') or d.get('filename') or '?'
+        # note every file this item writes, so a cancel can tidy them up
+        self._track(key, d.get('tmpfilename'), d.get('filename'), info.get('_filename'), info.get('filepath'))
+        if self.cancel.is_set():
+            raise DownloadCancelled('Cancelled by user')
         total = d.get('total_bytes') or d.get('total_bytes_estimate')
         done = d.get('downloaded_bytes') or 0
         self.q.put(('progress', {
@@ -802,10 +815,15 @@ class Worker(threading.Thread):
         }))
 
     def _pp_hook(self, d):
-        if self.cancel.is_set():
-            raise DownloadCancelled('Cancelled by user')
         info = d.get('info_dict') or {}
         key = info.get('id') or '?'
+        if d.get('status') == 'finished' and d.get('postprocessor') == 'MoveFiles':
+            with self._lock:
+                self._finished.add(key)
+        else:
+            self._track(key, info.get('filepath'), info.get('_filename'))
+        if self.cancel.is_set():
+            raise DownloadCancelled('Cancelled by user')
         if d.get('status') == 'started':
             self.q.put(('pp', {'key': key, 'title': info.get('title'), 'pp': d.get('postprocessor')}))
         elif d.get('status') == 'finished' and d.get('postprocessor') == 'MoveFiles':
@@ -1012,6 +1030,56 @@ class Worker(threading.Thread):
         for t in threads:
             t.join()
 
+    def _leftovers(self):
+        """Files belonging to items that didn't finish: partial downloads, separate video/audio pieces,
+        fragments, half-merged temp files and resume markers. Only files changed during this run."""
+        import glob
+        from yt_dlp.utils import prepend_extension
+        with self._lock:
+            unfinished = {k: set(v) for k, v in self._touched.items() if k not in self._finished}
+            protected = set(self._existing)
+        found = set()
+        for paths in unfinished.values():
+            for p in paths:
+                cands = {p, p + '.part', p + '.ytdl', p + '.part.ytdl', prepend_extension(p, 'temp')}
+                if p.endswith('.part'):
+                    cands |= {p[:-5], p[:-5] + '.ytdl'}
+                for base in (p, p[:-5] if p.endswith('.part') else p):
+                    cands.update(glob.glob(glob.escape(base) + '.part-Frag*'))
+                    cands.update(glob.glob(glob.escape(base) + '-Frag*'))
+                for c in cands:
+                    try:
+                        full = os.path.normcase(os.path.abspath(c))
+                        if (full not in protected and os.path.isfile(c)
+                                and os.path.getmtime(c) >= self._started_at - 2):
+                            found.add(c)
+                    except OSError:
+                        pass
+        return sorted(found)
+
+    def _clean_up_unfinished(self):
+        files = self._leftovers()
+        removed, stuck = [], []
+        for f in files:
+            for attempt in range(6):  # FFmpeg may still be letting go of a file for a moment
+                try:
+                    os.remove(f)
+                    removed.append(f)
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    time.sleep(0.5)
+            else:
+                stuck.append(f)
+        if removed:
+            self.q.put(('log', f'Cleaned up {len(removed)} unfinished file(s): '
+                               + ', '.join(os.path.basename(f) for f in removed[:5])
+                               + (' …' if len(removed) > 5 else '')))
+        if stuck:
+            self.q.put(('log', f'WARNING: could not delete {len(stuck)} unfinished file(s) (still in use): '
+                               + ', '.join(os.path.basename(f) for f in stuck[:5])))
+
     def run(self):
         try:
             self._run_jobs(self._opts())
@@ -1023,6 +1091,8 @@ class Worker(threading.Thread):
             ok = self.errors == 0
         except DownloadCancelled:
             self.q.put(('log', 'Download cancelled.'))
+            if self.clean_on_cancel:
+                self._clean_up_unfinished()
             ok = None
         except SystemExit as e:
             ok = False
@@ -2396,6 +2466,9 @@ class App(tk.Tk):
         ttk.Checkbutton(nf, text='Only download new items (remember what I already have)',
                         variable=self.only_new).pack(side='left')
         ttk.Button(nf, text='Forget…', width=8, command=self._forget_history).pack(side='left', padx=(6, 0))
+        self.clean_on_cancel = tk.BooleanVar()
+        ttk.Checkbutton(ext, text='Delete unfinished files when I cancel', variable=self.clean_on_cancel).grid(
+            row=8, column=0, columnspan=2, sticky='w', pady=(2, 0))
 
         # -- Output
         out = ttk.LabelFrame(root, text='Output', padding=8)
@@ -2693,7 +2766,8 @@ class App(tk.Tk):
             n = 1
         self._overall_total = 0
         self._skipped = 0
-        self.worker = Worker(urls, args, self.q, parallel=n, args_whole=args_whole, clip_confirmed=clip_confirmed)
+        self.worker = Worker(urls, args, self.q, parallel=n, args_whole=args_whole, clip_confirmed=clip_confirmed,
+                             clean_on_cancel=s.get('clean_on_cancel', True))
         self.worker.start()
 
     def _ask_clip_many(self, what, clip):
