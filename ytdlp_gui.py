@@ -628,6 +628,7 @@ def make_ydl(opts):
         key = ie.ie_key()
         ydl._ies = {key: ydl._ies.pop(key), **ydl._ies}
     ydl.add_post_processor(RelayClipsPP(ydl), when='before_dl')
+    ydl.add_post_processor(DupeNamePP(ydl), when='video')
     return ydl
 
 
@@ -1007,6 +1008,8 @@ def output_template(s, clip=None):
     template = s['template'] or DEFAULTS['template']
     if s.get('suno_id', True) and '%(id)s' not in template:
         template = _before_ext(template, '%(suno_tag|)s')  # Suno only: " [4f85f050]"; empty for other sites
+    # only set when another song already has this name: " (Artist)" (see DupeNamePP)
+    template = _before_ext(template, '%(grabbit_dupe|)s')
     if clip:
         # keep clips from overwriting (or being skipped because of) the full download
         template = _before_ext(template, ' [clip %(section_start).1f-%(section_end).1fs]' if clip[1] is not None
@@ -1166,6 +1169,7 @@ class Worker(threading.Thread):
                  format_overrides=None, item_picks=None):
         super().__init__(daemon=True)
         self.item_picks = dict(item_picks or {})  # playlist link -> ids of the only items to download
+        self._name_claims = ({}, threading.Lock())  # file name -> id, so two songs never share a name
         self.format_overrides = dict(format_overrides or {})  # link -> exact format for that link only
         self.clean_on_cancel = clean_on_cancel
         self._started_at = time.time()
@@ -1367,6 +1371,7 @@ class Worker(threading.Thread):
         def worker():
             try:
                 ydl = make_ydl(dict(base_opts))
+                ydl._grabbit_claims = self._name_claims
             except Exception as e:
                 self._on_error()
                 self.q.put(('log', f'ERROR: could not start yt-dlp: {e}'))
@@ -1378,6 +1383,7 @@ class Worker(threading.Thread):
                     return ydl
                 if 'ydl' not in whole:
                     whole['ydl'] = make_ydl(self._opts(self.args_whole))
+                    whole['ydl']._grabbit_claims = self._name_claims
                 return whole['ydl']
 
             with ydl:
@@ -1750,6 +1756,104 @@ def _needs_relay(f):
 
 
 from yt_dlp.postprocessor.common import PostProcessor  # noqa: E402
+
+
+def _same_name_files(path):
+    """Media files that already have this name (any extension: the song may have become an .mp3)."""
+    folder = os.path.dirname(path) or '.'
+    base = os.path.basename(os.path.splitext(path)[0])
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        stem, ext = os.path.splitext(n)
+        if stem == base and ext.lstrip('.').lower() in MEDIA_EXTS:
+            out.append(os.path.join(folder, n))
+    return out
+
+
+def _file_tags(path):
+    """A media file's tags (lower-case keys), via ffprobe. {} if unreadable."""
+    probe = shutil.which('ffprobe')
+    if not probe:
+        return {}
+    try:
+        r = subprocess.run([probe, '-v', 'error', '-show_entries', 'format_tags', '-of', 'json', path],
+                           capture_output=True, timeout=20, creationflags=_NO_WINDOW)
+        tags = (json.loads(r.stdout or b'{}').get('format') or {}).get('tags') or {}
+        return {str(k).lower(): str(v) for k, v in tags.items()}
+    except Exception:
+        return {}
+
+
+def _people(info):
+    names = [info.get(k) for k in ('artist', 'creator', 'uploader', 'channel', 'album_artist')]
+    names += [a for a in info.get('artists') or [] if isinstance(a, str)]
+    return {n.strip().casefold() for n in names if isinstance(n, str) and n.strip()}
+
+
+def belongs_to_another(path, info):
+    """True when the file at `path` is clearly a different video/song than `info` (same name, other artist)."""
+    vid = str(info.get('id') or '')
+    tags = _file_tags(path)
+    blob = ' '.join(tags.values())
+    if vid and vid in blob:
+        return False  # it's this very song
+    if re.search(r'\b[a-z][a-z0-9+.-]*://', blob, re.I):
+        return True   # tagged with the link of something else
+    theirs = (tags.get('artist') or tags.get('album_artist') or '').strip().casefold()
+    mine = _people(info)
+    if theirs and mine and not any(theirs == m or theirs in m or m in theirs for m in mine):
+        return True
+    ie = info.get('extractor_key') or info.get('ie_key')
+    if ie and vid:  # what the library says was saved there
+        here = os.path.normcase(os.path.abspath(path))
+        for e in library_load():
+            if os.path.normcase(e.get('path') or '') == here and e.get('archive'):
+                return e['archive'] != make_archive_id(ie, vid)
+    return False
+
+
+class DupeNamePP(PostProcessor):
+    """Two different songs with the same title (e.g. by different bands) would get the same file name, and the
+    second would be skipped as "already downloaded" — then have its tags written over the first one's file.
+    Before the name is decided, spot that and give the newcomer its own name: "Title (Artist).mp3"."""
+
+    def run(self, info):
+        ydl = self._downloader
+        try:
+            fn = ydl.prepare_filename(info)
+        except Exception:
+            return [], info
+        if not fn:
+            return [], info
+        vid = info.get('id')
+        claims, lock = getattr(ydl, '_grabbit_claims', None) or ({}, threading.Lock())
+
+        def taken(name):
+            key = os.path.normcase(os.path.splitext(os.path.abspath(name))[0])
+            with lock:
+                owner = claims.get(key)
+                if owner is None:
+                    if not any(belongs_to_another(p, info) for p in _same_name_files(name)):
+                        claims[key] = vid
+                        return False
+                    return True
+                return owner != vid
+
+        if not taken(fn):
+            return [], info
+        who = next((info.get(k) for k in ('artist', 'creator', 'uploader', 'channel') if info.get(k)), None)
+        for extra in ([f' ({who})'] if who else []) + [f' [{vid}]', f' [{vid}] (2)']:
+            info['grabbit_dupe'] = extra
+            new = ydl.prepare_filename(info)
+            if not taken(new):
+                self.to_screen(f'"{os.path.basename(fn)}" is already used by a different song — saving this one as '
+                               f'"{os.path.basename(new)}"')
+                break
+        return [], info
 
 
 class RelayClipsPP(PostProcessor):
