@@ -1867,11 +1867,15 @@ class PreviewWindow(tk.Toplevel):
             ttk.Button(ctl, text=text, width=5, command=lambda d=d: self._nudge(d)).pack(side='left', padx=(3, 0))
         ttk.Button(ctl, text='Set start  [', command=self._set_start).pack(side='left', padx=(16, 3))
         ttk.Button(ctl, text='Set end  ]', command=self._set_end).pack(side='left', padx=3)
-        self.btn_stop = ttk.Button(ctl, text='■', width=3, command=self._stop_sound)
-        self.btn_hear = ttk.Button(ctl, text='▶ Hear 5 s', command=self._hear)
+        self.btn_stop = ttk.Button(ctl, text='■ Stop', width=7, command=self._stop_sound)
+        self.btn_hear = ttk.Button(ctl, text='Hear 5 s', command=self._hear)
+        self.btn_play = ttk.Button(ctl, text='▶ Play', width=8, style='Accent.TButton', command=self._toggle_play)
+        self._play = None      # while playing: {'gen', 't0', 'wall0', 'end', 'next', 'path'}
+        self._play_gen = 0
         if self._winsound:
             self.btn_stop.pack(side='right')
-            self.btn_hear.pack(side='right', padx=(0, 3))
+            self.btn_play.pack(side='right', padx=(0, 3))
+            self.btn_hear.pack(side='right', padx=(0, 8))
             vol = app.preview_volume
             self.lbl_vol = ttk.Label(ctl, width=5, anchor='e')
             vs = ttk.Scale(ctl, from_=0, to=100, orient='horizontal', length=110, variable=vol, takefocus=False,
@@ -1895,7 +1899,7 @@ class PreviewWindow(tk.Toplevel):
         self.lbl_hint = ttk.Label(outer, style='Hint.TLabel',
                                   text='Click or drag on the timeline · ←/→ 1 s · Shift 5 s · Ctrl 0.1 s · '
                                        'Home/End go to clip start/end · [ ] set start/end'
-                                       + (' · Space to hear' if self._winsound else '')
+                                       + (' · Space to play/pause' if self._winsound else '')
                                        + ' · Make the window bigger for a finer timeline')
         self.lbl_hint.grid(row=6, column=0, sticky='w', pady=(6, 0))
 
@@ -1909,7 +1913,7 @@ class PreviewWindow(tk.Toplevel):
         self.bind('<End>', lambda e: self._seek(self.end if self.end is not None else (self.duration or 0), now=True))
         self.bind('[', lambda e: self._set_start())
         self.bind(']', lambda e: self._set_end())
-        self.bind('<space>', lambda e: self._hear())
+        self.bind('<space>', lambda e: self._toggle_play())
         self.bind('<Escape>', lambda e: self._close())
         self.protocol('WM_DELETE_WINDOW', self._close)
 
@@ -1998,8 +2002,14 @@ class PreviewWindow(tk.Toplevel):
                         self._strip_imgs.append(img)
                         self.tl.create_image(0, 0, image=img, anchor='nw', tags='bgimg')
                         self.tl.tag_raise('ov')
+                elif kind == 'chunk':
+                    self._on_chunk(*item[1:])
+                elif kind == 'chunk_error':
+                    if item[1] == self._play_gen:
+                        self._stop_sound()
+                        self.lbl_sel.configure(text=f"Couldn't get audio here: {item[2]}")
                 elif kind == 'snip':
-                    self.btn_hear.configure(text='▶ Hear 5 s')
+                    self.btn_hear.configure(text='Hear 5 s')
                     try:
                         w = self._winsound
                         w.PlaySound(item[1], w.SND_FILENAME | w.SND_ASYNC | w.SND_NODEFAULT)
@@ -2007,7 +2017,7 @@ class PreviewWindow(tk.Toplevel):
                     except Exception as e:
                         self.lbl_sel.configure(text=f'Could not play audio: {e}')
                 elif kind == 'snip_error':
-                    self.btn_hear.configure(text='▶ Hear 5 s')
+                    self.btn_hear.configure(text='Hear 5 s')
                     self.lbl_sel.configure(text=f"Couldn't get audio here: {item[1]}")
                 elif kind == 'error':
                     self.lbl_title.configure(text='Preview not available')
@@ -2156,6 +2166,10 @@ class PreviewWindow(tk.Toplevel):
             return
         self.t = max(0.0, min(float(t), max(0.0, self.duration - 0.05)))
         self._update_labels()
+        if self._play is not None:  # moved while playing: carry on playing from the new spot
+            if getattr(self, '_replay_job', None):
+                self.after_cancel(self._replay_job)
+            self._replay_job = self.after(250, self._replay_here)
         if self.src and self.src['video']:
             if self._debounce:
                 self.after_cancel(self._debounce)
@@ -2256,7 +2270,11 @@ class PreviewWindow(tk.Toplevel):
     def _on_volume(self, _value=None):
         self._show_volume()
         # if a snippet is playing, replay it from the same spot at the new volume (once the slider settles)
-        if self._playing_from is not None and time.time() < self._playing_until:
+        if self._play is not None:
+            if self._vol_job:
+                self.after_cancel(self._vol_job)
+            self._vol_job = self.after(300, lambda: self._play_from(self.t))
+        elif self._playing_from is not None and time.time() < self._playing_until:
             if self._vol_job:
                 self.after_cancel(self._vol_job)
             self._vol_job = self.after(300, lambda: self._hear(start=self._playing_from))
@@ -2285,8 +2303,139 @@ class PreviewWindow(tk.Toplevel):
                 return ('snip_error', str(e))
         self._bg(work)
 
+    # ---- playing (as long as you like) ----
+    # winsound can only play whole WAV files, so the audio is cut into pieces that are fetched one ahead:
+    # a short first piece so it starts quickly, then a minute at a time.
+    FIRST_CHUNK, CHUNK = 8.0, 60.0
+
+    def _toggle_play(self):
+        if self._play is not None:
+            self._stop_sound()  # pause: the playhead stays where it got to
+        else:
+            self._play_from(self.t)
+
+    def _play_from(self, t):
+        if not self._winsound or not self.src or not self.duration:
+            return
+        s = self.src['audio'] or self.src['video']
+        if not s:
+            return
+        self._vol_job = None
+        self._stop_sound()
+        vol = self._volume()
+        if vol <= 0:
+            self.lbl_sel.configure(text='Volume is at 0% — turn it up to hear the audio')
+            return
+        if t >= self.duration - 0.2:
+            t = self.start or 0.0  # at the very end: play from the clip start / the beginning
+            self._seek(t, now=True)
+        self._play_gen += 1
+        gen = self._play_gen
+        self._play = {'gen': gen, 't0': t, 'wall0': None, 'end': t, 'path': None, 'next': None,
+                      'vol': vol, 'src': s, 'last_frame': 0.0}
+        self.btn_play.configure(text='⏸ Pause')
+        self._fetch_chunk(gen, t, self.FIRST_CHUNK)
+        self.after(100, self._play_tick)
+
+    def _replay_here(self):
+        self._replay_job = None
+        if self._play is not None:
+            self._play_from(self.t)
+
+    def _fetch_chunk(self, gen, t, length):
+        length = min(length, self.duration - t)
+        if length <= 0.05:
+            return
+        pl = self._play
+        self._snip_n += 1
+        path = os.path.join(self._tmp, f'play{self._snip_n}.wav')
+        s, vol = pl['src'], pl['vol']
+        pl['fetching'] = True
+
+        def work():
+            try:
+                return ('chunk', gen, path, t, length, audio_snippet(s, t, length, path, vol))
+            except Exception as e:
+                return ('chunk_error', gen, str(e))
+        self._bg(work)
+
+    def _on_chunk(self, gen, path, t, length, _done):
+        pl = self._play
+        if pl is None or gen != pl['gen']:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return
+        pl['fetching'] = False
+        pl['next'] = (path, t, length)
+        if pl['wall0'] is None:  # the first piece: start playing
+            self._start_chunk()
+
+    def _start_chunk(self):
+        pl = self._play
+        path, t, length = pl.pop('next')
+        pl['next'] = None
+        w = self._winsound
+        try:
+            w.PlaySound(path, w.SND_FILENAME | w.SND_ASYNC | w.SND_NODEFAULT)
+        except Exception as e:
+            self._stop_sound()
+            self.lbl_sel.configure(text=f'Could not play audio: {e}')
+            return
+        old, pl['path'] = pl['path'], path
+        if old:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        pl['t0'], pl['wall0'], pl['end'] = t, time.time(), t + length
+        if pl['end'] < self.duration - 0.05:
+            self._fetch_chunk(pl['gen'], pl['end'], self.CHUNK)  # get the next piece while this one plays
+
+    def _play_tick(self):
+        pl = self._play
+        if self._closed or pl is None:
+            return
+        if pl['wall0'] is not None:
+            pos = pl['t0'] + (time.time() - pl['wall0'])
+            if pos >= pl['end'] - 0.03:
+                if pl['next']:
+                    self._start_chunk()
+                    pos = pl['t0']
+                elif pl['end'] >= self.duration - 0.05:
+                    self._stop_sound()
+                    self.t = max(0.0, self.duration - 0.05)
+                    self._update_labels()
+                    return
+                else:
+                    pos = pl['end']  # waiting for the next piece to arrive
+                    self.lbl_time.configure(text='loading…')
+            self.t = max(0.0, min(pos, self.duration - 0.05))
+            self._update_labels()
+            # keep the picture roughly in step, without asking for a frame more than once a second
+            if self.src and self.src['video'] and time.time() - pl['last_frame'] >= 1.0:
+                pl['last_frame'] = time.time()
+                self._fetch_frame()
+        self.after(100, self._play_tick)
+
     def _stop_sound(self):
         self._playing_from = None
+        if self._play is not None:
+            old = self._play.get('path')
+            self._play = None
+            self._play_gen += 1
+            try:
+                self.btn_play.configure(text='▶ Play')
+            except tk.TclError:
+                pass
+            if old:
+                def tidy(path=old):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                self.after(500, tidy)
         if self._winsound:
             try:
                 self._winsound.PlaySound(None, 0)
@@ -2306,7 +2455,8 @@ class PreviewWindow(tk.Toplevel):
 
     def _close(self):
         self._closed = True
-        for job in (self._resize_job, self._frame_job, self._debounce, getattr(self, '_vol_job', None)):
+        for job in (self._resize_job, self._frame_job, self._debounce, getattr(self, '_vol_job', None),
+                    getattr(self, '_replay_job', None)):
             if job:
                 try:
                     self.after_cancel(job)
