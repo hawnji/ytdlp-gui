@@ -2892,7 +2892,7 @@ class SearchWindow(tk.Toplevel):
     """Search a site, tick results and add them to the download list."""
     STEP, MAX = 50, 300
 
-    def _setup(self, app, title):
+    def _make_window(self, app, title):
         """Window, shared state and the outer frame (also used by the playlist picker)."""
         import base64
         self._b64 = base64.b64encode
@@ -2911,7 +2911,7 @@ class SearchWindow(tk.Toplevel):
 
     def __init__(self, app, query='', site='YouTube'):
         super().__init__(app)
-        outer = self._setup(app, 'Search')
+        outer = self._make_window(app, 'Search')
         top = ttk.Frame(outer)
         top.pack(fill='x')
         self.query = tk.StringVar(value=query)
@@ -3179,7 +3179,7 @@ class PlaylistPicker(SearchWindow):
 
     def __init__(self, app, url):
         tk.Toplevel.__init__(self, app)
-        outer = self._setup(app, 'Pick items')
+        outer = self._make_window(app, 'Pick items')
         self.url = url
         self.n = 0
         top = ttk.Frame(outer)
