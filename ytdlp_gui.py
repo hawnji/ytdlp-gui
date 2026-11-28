@@ -120,6 +120,8 @@ class SunoIE(InfoExtractor):
             'timestamp': parse_iso8601(clip.get('created_at')),
             'description': meta.get('tags'),
             'webpage_url': f'https://suno.com/song/{song_id}',
+            # Suno songs often share titles; file names can include this short ID to tell versions apart
+            'suno_tag': f' [{song_id[:8]}]',
         }
 
 
@@ -477,6 +479,7 @@ DEFAULTS = {
     'only_new': False,
     'watch_clipboard': False,
     'clear_done': True,
+    'suno_id': True,
     'preview_volume': 50.0,
     'clip_precise': True,
     'dark': True,
@@ -622,6 +625,10 @@ def build_args(s):
     """Turn GUI settings into yt-dlp command-line arguments."""
     args = ['--newline', '--no-colors']
     template = s['template'] or DEFAULTS['template']
+    if s.get('suno_id', True) and '%(id)s' not in template:
+        # Suno only: " [4f85f050]" before the extension (empty for every other site)
+        template = (template[:-len('.%(ext)s')] + '%(suno_tag|)s.%(ext)s'
+                    if template.endswith('.%(ext)s') else template + '%(suno_tag|)s')
     clip = clip_range(s)
     if clip:
         start, end = clip
@@ -682,10 +689,30 @@ def build_args(s):
     return args
 
 
+_SKIP_HISTORY_RE = re.compile(r'^\[download\] (?:(?P<id>[^\s:]+): )?(?P<title>.*?)\s*has already been recorded in the archive')
+_SKIP_EXISTS_RE = re.compile(r'^\[download\] (?P<path>.+?) has already been downloaded$')
+
+
 class GuiLogger:
-    def __init__(self, q, on_error=None):
+    def __init__(self, q, on_error=None, on_exists=None):
         self.q = q
         self.on_error = on_error
+        self.on_exists = on_exists
+
+    def _skip(self, msg):
+        m = _SKIP_HISTORY_RE.match(msg)
+        if m:
+            title = m.group('title') or m.group('id') or 'item'
+            self.q.put(('skipped', {'key': m.group('id'), 'title': title, 'reason': 'history'}))
+            self.q.put(('log', f'Skipped (already in your download history): {title}'))
+            return True
+        m = _SKIP_EXISTS_RE.match(msg)
+        if m:
+            if self.on_exists:
+                self.on_exists(m.group('path'))
+            self.q.put(('log', f'Skipped (file already in the folder): {os.path.basename(m.group("path"))}'))
+            return True
+        return False
 
     def debug(self, msg):
         # yt-dlp routes normal [info] messages through debug(); hide true debug noise
@@ -693,9 +720,13 @@ class GuiLogger:
             return
         if msg.startswith('[download]') and '%' in msg:
             return  # progress lines are shown in the table instead
+        if self._skip(msg):
+            return
         self.q.put(('log', msg))
 
     def info(self, msg):
+        if self._skip(msg):
+            return
         self.q.put(('log', msg))
 
     def warning(self, msg):
@@ -727,10 +758,15 @@ class Worker(threading.Thread):
         self._root = {}          # id(playlist item) -> the link it came from
         self._failed_roots = set()
         self._key_roots = {}     # (site, video id) -> every pasted link that contains that video
+        self._existing = set()   # files yt-dlp found already in the folder (skipped, not downloaded)
 
     @property
     def urls(self):
         return [j[1] for j in self.jobs if j[0] == 'url']
+
+    def _on_exists(self, path):
+        with self._lock:
+            self._existing.add(os.path.normcase(os.path.abspath(path)))
 
     def _on_error(self):
         with self._lock:
@@ -766,7 +802,10 @@ class Worker(threading.Thread):
             self.q.put(('pp', {'key': key, 'title': info.get('title'), 'pp': d.get('postprocessor')}))
         elif d.get('status') == 'finished' and d.get('postprocessor') == 'MoveFiles':
             self.q.put(('done_item', {'key': key, 'path': info.get('filepath'),
-                                      'url': info.get('webpage_url') or info.get('original_url')}))
+                                      'url': info.get('webpage_url') or info.get('original_url'),
+                                      'title': info.get('title'),
+                                      'skipped': bool(info.get('filepath')) and os.path.normcase(
+                                          os.path.abspath(info['filepath'])) in self._existing}))
 
     def _clip_decision(self, n, title):
         """A clip is set and a playlist turned out to have n items: ask the user once per run."""
@@ -785,7 +824,7 @@ class Worker(threading.Thread):
 
     def _opts(self, args=None):
         opts = dict(yt_dlp.parse_options(args or self.args).ydl_opts)
-        opts['logger'] = GuiLogger(self.q, self._on_error)
+        opts['logger'] = GuiLogger(self.q, self._on_error, self._on_exists)
         opts['progress_hooks'] = [self._hook]
         opts['postprocessor_hooks'] = [self._pp_hook]
         opts['noprogress'] = True
@@ -2074,6 +2113,7 @@ class App(tk.Tk):
         self.rows = {}
         self.settings = dict(DEFAULTS)
         self._col_widths = {}
+        self._skipped = 0
         self._load_settings()
         self.palette = PALETTES['dark' if self.settings.get('dark', True) else 'light']
         self._style()
@@ -2182,6 +2222,7 @@ class App(tk.Tk):
         self.log.tag_configure('warn', foreground=p['warn'])
         self.log.tag_configure('err', foreground=p['err'])
         self.tree.tag_configure('done', foreground=p['ok'])
+        self.tree.tag_configure('skip', foreground=p['muted'])
         self.tree.tag_configure('err', foreground=p['err'])
         self._set_titlebar(self)
 
@@ -2348,6 +2389,9 @@ class App(tk.Tk):
             '%(playlist_title|Singles)s/%(playlist_index|)s%(playlist_index& - |)s%(title)s.%(ext)s',
             '%(uploader)s/%(upload_date>%Y-%m-%d)s - %(title)s.%(ext)s',
         ]).grid(row=2, column=1, sticky='ew', padx=6, pady=4)
+        self.suno_id = tk.BooleanVar()
+        ttk.Checkbutton(out, text='Add song ID to Suno names', variable=self.suno_id).grid(
+            row=2, column=2, columnspan=2, sticky='w', padx=(4, 0))
         ttk.Label(out, text='Extra arguments').grid(row=3, column=0, sticky='w')
         ttk.Entry(out, textvariable=self.extra_args).grid(row=3, column=1, sticky='ew', padx=6)
         ttk.Button(out, text='Pick…', command=self._pick_args).grid(row=3, column=2, sticky='ew')
@@ -2615,6 +2659,7 @@ class App(tk.Tk):
         except (tk.TclError, ValueError):
             n = 1
         self._overall_total = 0
+        self._skipped = 0
         self.worker = Worker(urls, args, self.q, parallel=n, args_whole=args_whole, clip_confirmed=clip_confirmed)
         self.worker.start()
 
@@ -3018,6 +3063,22 @@ class App(tk.Tk):
                     name = (data['pp'] or '').replace('FFmpeg', '').replace('PP', '') or 'Processing'
                     if data['pp'] != 'MoveFiles':
                         self.tree.set(iid, 'status', f'Processing ({name})')
+                elif kind == 'skipped':
+                    iid = self.rows.get(data['key']) if data.get('key') else None
+                    if iid is None:
+                        iid = self._row(data.get('key') or f"skip-{len(self.rows)}", data['title'])
+                    self.tree.set(iid, 'status', 'Skipped – in history')
+                    self.tree.set(iid, 'progress', '')
+                    self.tree.item(iid, tags=('skip',))
+                    self._skipped += 1
+                elif kind == 'done_item' and data.get('skipped'):
+                    iid = self._row(data['key'], data.get('title'))
+                    self.tree.set(iid, 'status', 'Skipped – file exists')
+                    self.tree.set(iid, 'progress', '')
+                    self.tree.item(iid, tags=('skip',))
+                    self.row_paths[iid] = data['path']
+                    self.row_jobs.pop(iid, None)
+                    self._skipped += 1
                 elif kind == 'done_item':
                     iid = self._row(data['key'])
                     self.tree.set(iid, 'status', '✔ Done')
@@ -3070,14 +3131,19 @@ class App(tk.Tk):
                     if data is None:
                         self.status.set('Cancelled')
                     elif data:
-                        self.status.set(f'Finished in {human_eta(secs)}')
+                        self.status.set(f'Finished in {human_eta(secs)}'
+                                        + (f' — {self._skipped} skipped (see log)' if self._skipped else ''))
                         self.progress['value'] = 100
                     elif self.row_jobs:
                         self.status.set(f'Finished — {len(self.row_jobs)} failed (right-click or Retry failed)')
                     else:
                         self.status.set('Finished with errors — see log')
+                    if self._skipped:
+                        self._log(f'{self._skipped} item(s) were skipped because you already have them '
+                                  '(file in the folder, or in your download history).')
                     for key, iid in self.rows.items():
-                        if self.tree.set(iid, 'status') not in ('✔ Done', 'Error'):
+                        if self.tree.set(iid, 'status') not in ('✔ Done', 'Error') and \
+                                not self.tree.set(iid, 'status').startswith('Skipped'):
                             if data is None:
                                 self.tree.set(iid, 'status', 'Cancelled')
                             elif self.tree.set(iid, 'status') == 'Queued':
