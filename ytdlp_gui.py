@@ -58,7 +58,7 @@ except ImportError:
 
 import re
 from yt_dlp.extractor.common import InfoExtractor
-from yt_dlp.utils import ExtractorError, float_or_none, parse_iso8601, traverse_obj, url_or_none
+from yt_dlp.utils import ExtractorError, float_or_none, make_archive_id, parse_iso8601, traverse_obj, url_or_none
 
 
 _SUNO_CLERK = ('https://auth.suno.com', 'https://clerk.suno.com')  # Suno's login service (Clerk)
@@ -724,6 +724,8 @@ def write_updater_script(src, dst, exe_name, pids, workdir):
 
 SETTINGS_PATH = os.path.join(os.path.expanduser('~'), '.ytdlp_gui.json')
 ARCHIVE_PATH = os.path.join(os.path.expanduser('~'), '.ytdlp_gui_history.txt')
+LIBRARY_PATH = os.path.join(os.path.expanduser('~'), '.grabbit_library.jsonl')   # everything downloaded
+PENDING_PATH = os.path.join(os.path.expanduser('~'), '.grabbit_pending.json')    # links not finished yet
 
 VIDEO_QUALITIES = ['Best', '2160p (4K)', '1440p', '1080p', '720p', '480p', '360p', '240p']
 CONTAINERS = ['mp4', 'mkv', 'webm', 'Any']
@@ -761,6 +763,7 @@ DEFAULTS = {
     'notify_done': True,
     'notify_sound': False,
     'tray_on_minimize': False,
+    'pick_playlist_items': True,
     'suno_id': True,
     'preview_volume': 50.0,
     'clip_precise': True,
@@ -1089,8 +1092,9 @@ class Worker(threading.Thread):
     (the latter is how failed playlist items are retried with their playlist numbering intact)."""
 
     def __init__(self, jobs, args, q, parallel=1, args_whole=None, clip_confirmed=False, clean_on_cancel=True,
-                 format_overrides=None):
+                 format_overrides=None, item_picks=None):
         super().__init__(daemon=True)
+        self.item_picks = dict(item_picks or {})  # playlist link -> ids of the only items to download
         self.format_overrides = dict(format_overrides or {})  # link -> exact format for that link only
         self.clean_on_cancel = clean_on_cancel
         self._started_at = time.time()
@@ -1175,9 +1179,12 @@ class Worker(threading.Thread):
         if d.get('status') == 'started':
             self.q.put(('pp', {'key': key, 'title': info.get('title'), 'pp': d.get('postprocessor')}))
         elif d.get('status') == 'finished' and d.get('postprocessor') == 'MoveFiles':
+            ie = info.get('extractor_key') or info.get('ie_key')
             self.q.put(('done_item', {'key': key, 'path': info.get('filepath'),
                                       'url': info.get('webpage_url') or info.get('original_url'),
                                       'title': info.get('title'),
+                                      'site': info.get('extractor_key') or info.get('extractor') or '',
+                                      'archive': make_archive_id(ie, info['id']) if ie and info.get('id') else None,
                                       'skipped': bool(info.get('filepath')) and os.path.normcase(
                                           os.path.abspath(info['filepath'])) in self._existing}))
 
@@ -1335,7 +1342,12 @@ class Worker(threading.Thread):
                                             ydl.format_selector, ydl.params['format'] = saved
                                 else:
                                     ydl.download([item])
-                            elif entries:
+                            if entries and item in self.item_picks:
+                                picks = self.item_picks[item]
+                                total = len(entries)
+                                entries = [(e, ex) for e, ex in entries if e.get('id') in picks]
+                                self.q.put(('log', f'Only the {len(entries)} item(s) you picked, of {total}'))
+                            if entries:
                                 pl = entries[0][1].get('playlist') or item
                                 entry_kind = 'entry'
                                 if self.args_whole and len(entries) > 1:
@@ -2757,40 +2769,91 @@ def _entry_date(e):
     return ''
 
 
-def run_search(site, query, n, settings):
-    """Up to n results for a search: [{'url', 'id', 'title', 'channel', 'duration', 'views', 'thumb'}]."""
-    target = SEARCH_SITES[site](query, n)
+def _flat_opts(settings, **extra):
+    """yt-dlp options for quickly listing what's behind a link (titles only, nothing downloaded)."""
     opts = dict(yt_dlp.parse_options(build_args({**settings, 'clip_start': '', 'clip_end': ''})).ydl_opts)
-    # approximate_date: YouTube only says "3 weeks ago" in search results; this turns that into a date
+    # approximate_date: YouTube only says "3 weeks ago" in lists; this turns that into a date
     opts['extractor_args'] = {**(opts.get('extractor_args') or {}), 'youtubetab': {'approximate_date': ['']}}
-    opts.update(extract_flat='in_playlist', playlistend=n, quiet=True, no_warnings=True, skip_download=True,
-                noplaylist=False, logger=GuiLogger(queue.Queue()), postprocessors=[])
-    for k in ('download_ranges', 'download_archive', 'sleep_interval', 'max_sleep_interval'):
+    opts.update(extract_flat='in_playlist', quiet=True, no_warnings=True, skip_download=True,
+                noplaylist=False, logger=GuiLogger(queue.Queue()), postprocessors=[], **extra)
+    for k in ('download_ranges', 'download_archive', 'sleep_interval', 'max_sleep_interval', 'playlist_items'):
         opts.pop(k, None)
-    with make_ydl(opts) as ydl:
-        info = ydl.extract_info(target, download=False)
+    return opts
+
+
+def _is_list_entry(e):
+    """A playlist entry that is itself a list (a channel tab, a playlist), not a single video/song."""
+    ie = e.get('ie_key') or ''
+    return e.get('_type') in ('url', 'url_transparent') and (
+        ie in ('YoutubeTab', 'SoundcloudSet', 'SoundcloudUser', 'SunoPlaylist', 'SunoProfile')
+        or bool(re.search(r'youtube\.com/(?:playlist\?|channel/|@[^/]+/?(?:videos|shorts|streams)?$)', e.get('url') or '')))
+
+
+def normalize_entries(entries, n=None):
+    """Flat playlist/search entries -> [{'url', 'id', 'ie', 'title', 'channel', 'duration', 'views', 'thumb',
+    'date'}]. Entries that are lists themselves (channels, playlists) are left out."""
     results = []
-    for e in (info or {}).get('entries') or []:
-        if not e:
+    for e in entries or []:
+        if not e or _is_list_entry(e):
             continue
         vid = e.get('id')
-        youtube = (e.get('ie_key') or e.get('extractor_key') or '').startswith('Youtube') or 'youtube' in (e.get('url') or '')
-        if youtube and e.get('_type') == 'url' and e.get('ie_key') not in (None, 'Youtube'):
-            continue  # channels/playlists mixed into results
+        ie = e.get('ie_key') or e.get('extractor_key') or ''
+        youtube = ie.startswith('Youtube') or 'youtube' in (e.get('url') or '')
         url = f'https://www.youtube.com/watch?v={vid}' if youtube and vid else (e.get('webpage_url') or e.get('url'))
         if not url:
             continue
         thumb = (f'https://i.ytimg.com/vi/{vid}/mqdefault.jpg' if youtube and vid
                  else e.get('thumbnail') or _pick_thumb(e.get('thumbnails')))
         results.append({
-            'url': url, 'id': vid, 'title': e.get('title') or url,
+            'url': url, 'id': vid, 'ie': ie or ('Youtube' if youtube else ''), 'title': e.get('title') or url,
             'channel': e.get('channel') or e.get('uploader') or traverse_obj(e, ('artists', 0)) or '',
             'duration': e.get('duration'), 'views': e.get('view_count'), 'thumb': thumb,
             'date': _entry_date(e),
         })
-        if len(results) >= n:
+        if n and len(results) >= n:
             break
     return results
+
+
+def run_search(site, query, n, settings):
+    """Up to n results for a search: [{'url', 'id', 'title', 'channel', 'duration', 'views', 'thumb', …}]."""
+    with make_ydl(_flat_opts(settings, playlistend=n)) as ydl:
+        info = ydl.extract_info(SEARCH_SITES[site](query, n), download=False)
+    return normalize_entries((info or {}).get('entries'), n)
+
+
+_PLAYLIST_URL_RE = re.compile(
+    r'(?:youtube\.com/(?:playlist\?|channel/|c/|user/|@[^/?#]+/?(?:videos|shorts|streams|releases)?/?(?:[?#]|$))'
+    r'|music\.youtube\.com/(?:playlist\?|browse/)'
+    r'|soundcloud\.com/[^/]+/sets/'
+    r'|suno\.com/(?:playlist/|album/|@|me/?(?:[?#]|$)|create/?(?:[?#]|$)|library/?(?:[?#]|$)))', re.I)
+
+
+def looks_like_playlist(url):
+    """True for links that are clearly a list of things (playlist, album, channel, set) rather than one video."""
+    return bool(_PLAYLIST_URL_RE.search(url or ''))
+
+
+def read_history_ids():
+    """The 'site id' lines of the download history (things downloaded before)."""
+    try:
+        with open(ARCHIVE_PATH, encoding='utf-8') as f:
+            return {line.strip() for line in f if line.strip()}
+    except OSError:
+        return set()
+
+
+def list_playlist(url, settings):
+    """What's in a playlist/album/channel link: (title, items, number of sub-lists skipped)."""
+    with make_ydl(_flat_opts(settings)) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        return None, [], 0
+    if info.get('_type') not in ('playlist', 'multi_video'):
+        return info.get('title'), None, 0  # a single video, not a list
+    entries = [e for e in info.get('entries') or [] if e]
+    lists = sum(1 for e in entries if _is_list_entry(e))
+    return info.get('title') or url, normalize_entries(entries), lists
 
 
 def fetch_thumbnail(url, width=120, height=68):
@@ -2829,23 +2892,26 @@ class SearchWindow(tk.Toplevel):
     """Search a site, tick results and add them to the download list."""
     STEP, MAX = 50, 300
 
-    def __init__(self, app, query='', site='YouTube'):
-        super().__init__(app)
+    def _setup(self, app, title):
+        """Window, shared state and the outer frame (also used by the playlist picker)."""
         import base64
         self._b64 = base64.b64encode
         self.app = app
-        p = app.palette
-        self.title('Search')
-        self.configure(bg=p['bg'])
+        self.title(title)
+        self.configure(bg=app.palette['bg'])
         self.geometry(f'1000x{min(660, self.winfo_screenheight() - 120)}')
         self.minsize(760, 360)
         self.q = queue.Queue()
         self.results, self.images, self.n = [], {}, self.STEP
         self._gen = 0
         self._thumb_slots = threading.Semaphore(6)
-
         outer = ttk.Frame(self, padding=10)
         outer.pack(fill='both', expand=True)
+        return outer
+
+    def __init__(self, app, query='', site='YouTube'):
+        super().__init__(app)
+        outer = self._setup(app, 'Search')
         top = ttk.Frame(outer)
         top.pack(fill='x')
         self.query = tk.StringVar(value=query)
@@ -2876,7 +2942,15 @@ class SearchWindow(tk.Toplevel):
                        'right-click to preview, check formats or open in your browser').pack(
             side='bottom', anchor='w', pady=(6, 0))
         bot.pack(side='bottom', fill='x')
+        self._make_list(outer)
+        app._set_titlebar(self)
+        ent.focus_set()
+        self.after(60, self._pump)
+        if query.strip():
+            self.search()
 
+    def _make_list(self, outer):
+        p = self.app.palette
         mid = ttk.Frame(outer)
         mid.pack(fill='both', expand=True, pady=8)
         ttk.Style(self).configure('Search.Treeview', rowheight=74)
@@ -2902,12 +2976,6 @@ class SearchWindow(tk.Toplevel):
         self.tree.bind('<Button-1>', self._click)
         self.tree.bind('<Shift-Button-1>', lambda e: self._click(e, shift=True))
         self.tree.bind('<Button-3>', self._menu)
-
-        app._set_titlebar(self)
-        ent.focus_set()
-        self.after(60, self._pump)
-        if query.strip():
-            self.search()
 
     def search(self, more=False):
         q = self.query.get().strip()
@@ -3104,6 +3172,747 @@ class SearchWindow(tk.Toplevel):
             m.grab_release()
 
 
+class PlaylistPicker(SearchWindow):
+    """Tick which items of a playlist / album / channel to download. Only the ticked ones are downloaded
+    when that link runs (things you downloaded before start unticked)."""
+    MAX_THUMBS = 400
+
+    def __init__(self, app, url):
+        tk.Toplevel.__init__(self, app)
+        outer = self._setup(app, 'Pick items')
+        self.url = url
+        self.n = 0
+        top = ttk.Frame(outer)
+        top.pack(fill='x')
+        self.lbl_title = ttk.Label(top, text='Loading the list…', font=('Segoe UI', 12, 'bold'))
+        self.lbl_title.pack(anchor='w')
+        ttk.Label(top, text=url, style='Hint.TLabel').pack(anchor='w')
+
+        bot = ttk.Frame(outer)
+        self.status = tk.StringVar(value='Getting the list of items…')
+        ttk.Label(bot, textvariable=self.status).pack(side='left')
+        self.btn_now = ttk.Button(bot, text='Use these', style='Accent.TButton', command=self._use, state='disabled')
+        self.btn_now.pack(side='right')
+        ttk.Button(bot, text='Cancel', command=self.destroy).pack(side='right', padx=6)
+        self.btn_all = ttk.Button(bot, text='Check all', width=11, command=self._toggle_all)
+        self.btn_all.pack(side='right', padx=(0, 12))
+        self.btn_add = self.btn_more = None
+        ttk.Label(outer, style='Hint.TLabel',
+                  text='Only the ticked items are downloaded when this link runs · Shift-click ticks a range · '
+                       'click a column title to sort · right-click to preview').pack(
+            side='bottom', anchor='w', pady=(6, 0))
+        bot.pack(side='bottom', fill='x')
+        self._make_list(outer)
+        app._set_titlebar(self)
+        self.after(60, self._pump)
+        self._load()
+
+    def _load(self):
+        self._gen += 1
+        gen, settings = self._gen, self.app._collect()
+
+        def work():
+            try:
+                self.q.put(('list', gen, list_playlist(self.url, settings)))
+            except Exception as e:
+                self.q.put(('error', gen, str(e).replace('ERROR: ', '')))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _pump(self):
+        try:
+            while True:
+                kind, gen, data = self.q.get_nowait()
+                if gen != self._gen:
+                    continue
+                if kind == 'error':
+                    self.lbl_title.configure(text='Could not get the list')
+                    self.status.set(data)
+                elif kind == 'list':
+                    self._fill(*data)
+                elif kind == 'thumb':
+                    iid, png = data
+                    if png and self.tree.exists(iid):
+                        img = tk.PhotoImage(data=self._b64(png).decode())
+                        self.images[iid] = img
+                        self.tree.item(iid, image=img)
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(60, self._pump)
+
+    def _fill(self, title, items, lists):
+        self.lbl_title.configure(text=title or self.url)
+        if items is None:
+            self.status.set('This link is a single item, not a playlist — there is nothing to pick.')
+            return
+        if not items:
+            self.status.set('This link contains several lists (for example a channel\'s Videos and Shorts). '
+                            'Paste the one you want, like …/videos, and pick from that.' if lists
+                            else 'The list is empty.')
+            return
+        history = read_history_ids()
+        earlier = self.app.item_picks.get(self.url)
+        had = 0
+        for i, r in enumerate(items):
+            iid = str(i)
+            self.results.append(r)
+            self.tree.insert('', 'end', iid=iid, text='', values=(
+                '☐', r['title'], r['channel'], r.get('date', ''),
+                human_eta(r['duration']) if r['duration'] else '', human_count(r['views'])))
+            before = r['id'] and r['ie'] and f"{r['ie'].lower()} {r['id']}" in history
+            if before:
+                self.added.add(iid)  # greyed: downloaded before
+                had += 1
+            on = (r['id'] in earlier) if earlier is not None else not before
+            self._set_checked(iid, on)
+            if r['thumb'] and i < self.MAX_THUMBS:
+                self._load_thumb(self._gen, iid, r['thumb'])
+        self._had = had
+        self._update_count()
+
+    def _update_count(self):
+        n, total = len(self.checked), len(self.tree.get_children())
+        self.btn_now.configure(state='normal' if n else 'disabled',
+                               text=f'Use these {n}' if n and n < total else 'Use all')
+        everything = bool(total) and n == total
+        self.btn_all.configure(text='Uncheck all' if everything else 'Check all')
+        self.tree.heading('pick', text='☑' if everything else '☐')
+        if total:
+            had = getattr(self, '_had', 0)
+            self.status.set(f'{n} of {total} ticked' + (f' · {had} greyed out = downloaded before' if had else ''))
+
+    def _use(self):
+        ids = [self.results[int(i)]['id'] for i in self.checked]
+        if len(self.checked) == len(self.results) or not all(ids):
+            self.app.item_picks.pop(self.url, None)  # everything: no need to remember a selection
+        else:
+            self.app.item_picks[self.url] = set(ids)
+        self.app._add_urls([self.url], 'the playlist picker')
+        self.app._show_overrides()
+        self.destroy()
+
+
+AUDIO_EXTS = {'mp3', 'm4a', 'aac', 'opus', 'ogg', 'oga', 'wav', 'flac', 'alac', 'wma', 'aiff', 'aif', 'mka'}
+
+
+def save_pending(kind, urls, format_overrides=None, item_picks=None):
+    """Remember links that aren't finished, so they come back after Grabbit closes or crashes.
+    kind: 'batch' (they were downloading) or 'list' (they were just waiting in the box)."""
+    try:
+        if not urls:
+            if os.path.exists(PENDING_PATH):
+                os.remove(PENDING_PATH)
+            return
+        urls = list(dict.fromkeys(urls))
+        data = {'kind': kind, 'urls': urls, 't': int(time.time()),
+                'format_overrides': {u: f for u, f in (format_overrides or {}).items() if u in urls},
+                'item_picks': {u: sorted(i for i in ids if i) for u, ids in (item_picks or {}).items() if u in urls}}
+        tmp = PENDING_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        os.replace(tmp, PENDING_PATH)
+    except OSError:
+        pass
+
+
+def load_pending():
+    try:
+        with open(PENDING_PATH, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) and data.get('urls') else None
+    except (OSError, ValueError):
+        return None
+
+
+def library_add(entry):
+    """Note a finished download in the library (one JSON object per line, oldest first)."""
+    try:
+        with open(LIBRARY_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    except OSError:
+        pass
+
+
+def library_load():
+    """Everything in the library, newest first."""
+    items = []
+    try:
+        with open(LIBRARY_PATH, encoding='utf-8') as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and e.get('path'):
+                    items.append(e)
+    except OSError:
+        pass
+    items.reverse()
+    return items
+
+
+def library_save(items_newest_first):
+    tmp = LIBRARY_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        for e in reversed(items_newest_first):
+            f.write(json.dumps(e, ensure_ascii=False) + '\n')
+    os.replace(tmp, LIBRARY_PATH)
+
+
+def forget_in_history(archive_ids):
+    """Take these items out of the download history, so they can be downloaded again. Returns how many."""
+    gone = {a.strip().lower() for a in archive_ids if a}
+    if not gone:
+        return 0
+    try:
+        with open(ARCHIVE_PATH, encoding='utf-8') as f:
+            lines = f.readlines()
+    except OSError:
+        return 0
+    keep = [l for l in lines if l.strip().lower() not in gone]
+    if len(keep) != len(lines):
+        with open(ARCHIVE_PATH, 'w', encoding='utf-8') as f:
+            f.writelines(keep)
+    return len(lines) - len(keep)
+
+
+class LibraryWindow(tk.Toplevel):
+    """Everything Grabbit has downloaded: search it, open files, find them, or download them again."""
+    COLS = (('when', 'Downloaded', 130, 'w'), ('title', 'Title', 420, 'w'), ('site', 'Site', 110, 'w'),
+            ('type', 'Type', 70, 'center'), ('size', 'Size', 80, 'e'))
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        p = app.palette
+        self.title('Library')
+        self.configure(bg=p['bg'])
+        self.geometry(f'960x{min(620, self.winfo_screenheight() - 120)}')
+        self.minsize(700, 340)
+        self.items, self.shown = [], []
+        self._sort = ('when', True)
+
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill='both', expand=True)
+        top = ttk.Frame(outer)
+        top.pack(fill='x')
+        ttk.Label(top, text='Search').pack(side='left', padx=(0, 6))
+        self.query = tk.StringVar()
+        ent = ttk.Entry(top, textvariable=self.query)
+        ent.pack(side='left', fill='x', expand=True)
+        self.kind = tk.StringVar(value='Everything')
+        ttk.Combobox(top, textvariable=self.kind, values=('Everything', 'Audio', 'Video', 'Missing files'),
+                     state='readonly', width=14).pack(side='left', padx=6)
+        self.query.trace_add('write', lambda *_: self._fill())
+        self.kind.trace_add('write', lambda *_: self._fill())
+
+        bot = ttk.Frame(outer)
+        self.status = tk.StringVar()
+        ttk.Label(bot, textvariable=self.status).pack(side='left')
+        ttk.Button(bot, text='Clear library…', command=self._clear_all).pack(side='right')
+        ttk.Button(bot, text='Remove', command=self._remove).pack(side='right', padx=6)
+        ttk.Button(bot, text='Download again', command=self._again).pack(side='right', padx=(0, 12))
+        ttk.Button(bot, text='Show in folder', command=self._show).pack(side='right', padx=6)
+        ttk.Button(bot, text='Open', style='Accent.TButton', command=self._open).pack(side='right')
+        ttk.Label(outer, style='Hint.TLabel',
+                  text='Double-click to play/open · Ctrl/Shift-click to select several · right-click for more · '
+                       '"Remove" only takes it off this list (the file stays)').pack(side='bottom', anchor='w',
+                                                                                    pady=(6, 0))
+        bot.pack(side='bottom', fill='x')
+
+        mid = ttk.Frame(outer)
+        mid.pack(fill='both', expand=True, pady=8)
+        self.tree = ttk.Treeview(mid, columns=[c[0] for c in self.COLS], show='headings', selectmode='extended',
+                                 height=5)
+        for c, label, w, a in self.COLS:
+            self.tree.heading(c, text=label, command=lambda c=c: self._sort_by(c))
+            self.tree.column(c, width=w, anchor=a, stretch=(c == 'title'))
+        self.tree.tag_configure('missing', foreground=p['muted'])
+        sb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        self.tree.bind('<Double-1>', lambda e: self._open())
+        self.tree.bind('<Button-3>', self._menu)
+        self.tree.bind('<Return>', lambda e: self._open())
+        self.tree.bind('<Delete>', lambda e: self._remove())
+        app._set_titlebar(self)
+        ent.focus_set()
+        self.reload()
+
+    def reload(self):
+        self.items = library_load()
+        for e in self.items:
+            try:
+                e['_size'] = os.path.getsize(e['path'])
+                e['_missing'] = False
+            except OSError:
+                e['_size'], e['_missing'] = None, True
+            ext = os.path.splitext(e['path'])[1].lstrip('.').lower()
+            e['_type'] = ext.upper()
+            e['_audio'] = ext in AUDIO_EXTS
+        self._fill()
+
+    def _fill(self):
+        q = self.query.get().strip().casefold()
+        kind = self.kind.get()
+        rows = [e for e in self.items
+                if (not q or q in f"{e.get('title', '')} {e.get('site', '')} {os.path.basename(e['path'])}".casefold())
+                and (kind == 'Everything' or (kind == 'Audio' and e['_audio'])
+                     or (kind == 'Video' and not e['_audio']) or (kind == 'Missing files' and e['_missing']))]
+        col, desc = self._sort
+        keys = {'when': lambda e: e.get('t') or 0, 'title': lambda e: (e.get('title') or '').casefold(),
+                'site': lambda e: (e.get('site') or '').casefold(), 'type': lambda e: e['_type'],
+                'size': lambda e: e['_size'] or 0}
+        rows.sort(key=keys[col], reverse=desc)
+        self.shown = rows
+        self.tree.delete(*self.tree.get_children())
+        for i, e in enumerate(rows):
+            when = time.strftime('%Y-%m-%d %H:%M', time.localtime(e['t'])) if e.get('t') else ''
+            title = (e.get('title') or os.path.basename(e['path'])) + ('   (file moved or deleted)' if e['_missing'] else '')
+            self.tree.insert('', 'end', iid=str(i), values=(when, title, e.get('site') or '', e['_type'],
+                                                          human_bytes(e['_size']) if e['_size'] else ''),
+                             tags=('missing',) if e['_missing'] else ())
+        for c, label, *_ in self.COLS:
+            self.tree.heading(c, text=label + ((' ▼' if desc else ' ▲') if c == col else ''))
+        total, missing = len(self.items), sum(e['_missing'] for e in self.items)
+        self.status.set((f'{len(rows)} of {total}' if len(rows) != total else f'{total} download{"s" if total != 1 else ""}')
+                        + (f' · {missing} file{"s" if missing != 1 else ""} moved or deleted' if missing else '')
+                        if total else 'Nothing downloaded yet — finished downloads show up here.')
+
+    def _sort_by(self, col):
+        cur, desc = self._sort
+        self._sort = (col, not desc if cur == col else col in ('when', 'size'))
+        self._fill()
+
+    def _sel(self):
+        return [self.shown[int(i)] for i in self.tree.selection()]
+
+    def _open(self):
+        sel = self._sel()
+        for e in sel[:5]:
+            if e['_missing']:
+                self.status.set(f'"{e.get("title")}" is no longer where it was saved — try Download again')
+            else:
+                open_path(e['path'])
+
+    def _show(self):
+        sel = self._sel()
+        if sel:
+            e = sel[0]
+            if e['_missing'] and os.path.isdir(os.path.dirname(e['path'])):
+                open_path(os.path.dirname(e['path']))
+            elif not e['_missing']:
+                self.app._show_in_folder(e['path'])
+
+    def _again(self):
+        sel = [e for e in self._sel() if e.get('url')]
+        if not sel:
+            self.status.set('Select what you want to download again first')
+            return
+        forget_in_history(e.get('archive') for e in sel)
+        added = self.app._add_urls(list(dict.fromkeys(e['url'] for e in sel)), 'the library')
+        still = sum(1 for e in sel if not e['_missing'])
+        msg = f'Added {added} link{"s" if added != 1 else ""} to the download list'
+        if still:
+            msg += (f' · {still} still exist{"s" if still == 1 else ""} in your folder — move or delete '
+                    f'{"it" if still == 1 else "them"} first, or Grabbit will skip {"it" if still == 1 else "them"}')
+        self.status.set(msg)
+
+    def _remove(self):
+        sel = self._sel()
+        if not sel:
+            return
+        drop = {id(e) for e in sel}
+        self.items = [e for e in self.items if id(e) not in drop]
+        self._save()
+
+    def _clear_all(self):
+        if self.items and messagebox.askyesno(
+                APP_NAME, f'Clear all {len(self.items)} entries from the library?\n\nYour files are not deleted — '
+                'only this list is emptied.', parent=self):
+            self.items = []
+            self._save()
+
+    def _save(self):
+        try:
+            library_save([{k: v for k, v in e.items() if not k.startswith('_')} for e in self.items])
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f'Could not update the library:\n{e}', parent=self)
+        self.reload()
+
+    def _menu(self, ev):
+        iid = self.tree.identify_row(ev.y)
+        if not iid:
+            return
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        e = self.shown[int(iid)]
+        p = self.app.palette
+        m = tk.Menu(self, tearoff=0, background=p['surface'], foreground=p['fg'],
+                    activebackground=p['accent'], activeforeground=p['on_accent'])
+        m.add_command(label='Open', command=self._open, state='disabled' if e['_missing'] else 'normal')
+        m.add_command(label='Show in folder', command=self._show)
+        m.add_command(label='Download again', command=self._again, state='normal' if e.get('url') else 'disabled')
+        m.add_separator()
+        if e.get('url'):
+            m.add_command(label='Open page in browser', command=lambda: __import__('webbrowser').open(e['url']))
+            m.add_command(label='Copy link', command=lambda: self.app._copy(e['url']))
+        m.add_command(label='Remove from library', command=self._remove)
+        try:
+            m.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            m.grab_release()
+
+
+VIDEO_EXTS = {'mp4', 'mkv', 'webm', 'mov', 'avi', 'flv', 'wmv', 'm4v', 'ts', 'mts', 'm2ts', '3gp', 'mpg', 'mpeg',
+              'ogv'}
+MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS | {'webm'}
+
+# name -> (extension, is_audio, lossy, ffmpeg arguments builder taking a quality like '192k' or 'Best')
+def _abr(q, best):
+    return best if q.startswith('Best') else q
+
+
+CONVERT_PRESETS = {
+    'MP3 audio': ('mp3', True, True, lambda q: ['-vn', '-c:a', 'libmp3lame'] + (
+        ['-q:a', '0'] if q.startswith('Best') else ['-b:a', q])),
+    'M4A audio (AAC)': ('m4a', True, True, lambda q: ['-vn', '-c:a', 'aac', '-b:a', _abr(q, '256k')]),
+    'Opus audio': ('opus', True, True, lambda q: ['-vn', '-c:a', 'libopus', '-b:a', _abr(q, '192k')]),
+    'FLAC audio (lossless)': ('flac', True, False, lambda q: ['-vn', '-c:a', 'flac']),
+    'WAV audio (lossless)': ('wav', True, False, lambda q: ['-vn', '-c:a', 'pcm_s16le']),
+    'MP4 video (plays everywhere)': ('mp4', False, False, lambda q: [
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart']),
+    'MKV video (same quality, fast)': ('mkv', False, False, lambda q: ['-map', '0', '-c', 'copy']),
+}
+CONVERT_QUALITIES = ['Best', '320k', '256k', '192k', '128k', '96k']
+
+
+def convert_target(src, ext, folder=None):
+    """Where a converted file goes: next to the original (or in folder), never overwriting anything."""
+    folder = folder or os.path.dirname(os.path.abspath(src))
+    stem = os.path.splitext(os.path.basename(src))[0]
+    cand = os.path.join(folder, f'{stem}.{ext}')
+    if os.path.normcase(os.path.abspath(cand)) == os.path.normcase(os.path.abspath(src)):
+        cand = os.path.join(folder, f'{stem} (converted).{ext}')
+    n = 2
+    base = os.path.splitext(cand)[0]
+    while os.path.exists(cand):
+        cand = f'{base} ({n}).{ext}'
+        n += 1
+    return cand
+
+
+def convert_file(src, dst, args, progress=None, stop=None):
+    """Convert one file with FFmpeg. progress(fraction or None) is called as it goes. Raises on failure."""
+    ff = shutil.which('ffmpeg')
+    if not ff:
+        raise RuntimeError('FFmpeg was not found (it should be next to Grabbit.exe)')
+    dur = probe_duration((src, None))
+    proc = subprocess.Popen([ff, '-hide_banner', '-nostdin', '-loglevel', 'error', '-y', '-i', src, *args,
+                             '-progress', 'pipe:1', '-nostats', dst],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=_NO_WINDOW)
+    err = []
+    t = threading.Thread(target=lambda: err.extend(proc.stderr.read().decode('utf-8', 'replace').splitlines()),
+                         daemon=True)
+    t.start()
+    try:
+        for raw in proc.stdout:
+            if stop is not None and stop.is_set():
+                proc.terminate()
+                break
+            line = raw.decode('ascii', 'replace').strip()
+            if line.startswith('out_time_us=') and dur and progress:
+                try:
+                    progress(min(1.0, int(line.split('=', 1)[1]) / 1e6 / dur))
+                except ValueError:
+                    pass
+        proc.wait()
+        t.join(5)
+    except BaseException:
+        proc.kill()
+        raise
+    if stop is not None and stop.is_set():
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+        raise DownloadCancelled('stopped')
+    if proc.returncode != 0:
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+        raise RuntimeError(err[-1] if err else f'FFmpeg failed ({proc.returncode})')
+    return dst
+
+
+class ConvertWindow(tk.Toplevel):
+    """Convert files on your computer: pull the audio out of a video, or change the format."""
+
+    def __init__(self, app, files=()):
+        super().__init__(app)
+        self.app = app
+        p = app.palette
+        self.title('Convert files')
+        self.configure(bg=p['bg'])
+        self.geometry(f'900x{min(560, self.winfo_screenheight() - 120)}')
+        self.minsize(680, 340)
+        self.q = queue.Queue()
+        self.files = {}   # iid -> {'src', 'dst', 'state'}
+        self._n = 0
+        self.stop = threading.Event()
+        self.running = False
+
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill='both', expand=True)
+        top = ttk.Frame(outer)
+        top.pack(fill='x')
+        ttk.Label(top, text='Convert to').pack(side='left')
+        self.preset = tk.StringVar(value=app.settings.get('convert_preset') or 'MP3 audio')
+        if self.preset.get() not in CONVERT_PRESETS:
+            self.preset.set('MP3 audio')
+        ttk.Combobox(top, textvariable=self.preset, values=list(CONVERT_PRESETS), state='readonly', width=30).pack(
+            side='left', padx=6)
+        ttk.Label(top, text='Quality').pack(side='left', padx=(10, 0))
+        self.quality = tk.StringVar(value=app.settings.get('convert_quality') or 'Best')
+        self.cb_q = ttk.Combobox(top, textvariable=self.quality, values=CONVERT_QUALITIES, state='readonly', width=8)
+        self.cb_q.pack(side='left', padx=6)
+        self.preset.trace_add('write', lambda *_: self._on_preset())
+
+        dest = ttk.Frame(outer)
+        dest.pack(fill='x', pady=(8, 0))
+        self.same_folder = tk.BooleanVar(value=app.settings.get('convert_same_folder', True))
+        self.folder = tk.StringVar(value=app.settings.get('convert_folder') or '')
+        ttk.Radiobutton(dest, text='Save next to each original', value=True, variable=self.same_folder,
+                        command=self._on_dest).pack(side='left')
+        ttk.Radiobutton(dest, text='Save in', value=False, variable=self.same_folder,
+                        command=self._on_dest).pack(side='left', padx=(14, 4))
+        self.ent_folder = ttk.Entry(dest, textvariable=self.folder)
+        self.ent_folder.pack(side='left', fill='x', expand=True)
+        self.btn_folder = ttk.Button(dest, text='Browse…', command=self._browse)
+        self.btn_folder.pack(side='left', padx=(6, 0))
+
+        bot = ttk.Frame(outer)
+        self.status = tk.StringVar(value='Add files, or drag them onto this window.')
+        ttk.Label(bot, textvariable=self.status).pack(side='left')
+        self.btn_go = ttk.Button(bot, text='Convert', style='Accent.TButton', command=self._go)
+        self.btn_go.pack(side='right')
+        self.btn_stop = ttk.Button(bot, text='Stop', command=self.stop.set, state='disabled')
+        self.btn_stop.pack(side='right', padx=6)
+        ttk.Button(bot, text='Clear', command=self._clear).pack(side='right', padx=(0, 12))
+        ttk.Button(bot, text='Remove', command=self._remove).pack(side='right', padx=6)
+        ttk.Button(bot, text='Add files…', command=self._pick).pack(side='right')
+        ttk.Label(outer, style='Hint.TLabel', text='The originals are never changed · double-click a finished file '
+                  'to play it · right-click to show it in its folder').pack(side='bottom', anchor='w', pady=(6, 0))
+        bot.pack(side='bottom', fill='x')
+
+        mid = ttk.Frame(outer)
+        mid.pack(fill='both', expand=True, pady=8)
+        self.tree = ttk.Treeview(mid, columns=('file', 'size', 'status'), show='headings', selectmode='extended',
+                                 height=5)
+        for c, label, w, a in (('file', 'File', 520, 'w'), ('size', 'Size', 80, 'e'), ('status', 'Status', 200, 'w')):
+            self.tree.heading(c, text=label)
+            self.tree.column(c, width=w, anchor=a, stretch=(c == 'file'))
+        self.tree.tag_configure('done', foreground='#1a7f37')
+        self.tree.tag_configure('err', foreground='#cf222e')
+        sb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        self.tree.bind('<Double-1>', lambda e: self._open())
+        self.tree.bind('<Button-3>', self._menu)
+        self.tree.bind('<Delete>', lambda e: self._remove())
+        self._enable_drop()
+        self._on_preset()
+        self._on_dest()
+        app._set_titlebar(self)
+        self.protocol('WM_DELETE_WINDOW', self._close)
+        self.add_files(files)
+        self.after(80, self._pump)
+
+    # ----- files -----
+    def add_files(self, paths):
+        have = {os.path.normcase(f['src']) for f in self.files.values()}
+        added = 0
+        for path in paths:
+            path = os.path.abspath(path)
+            if not os.path.isfile(path) or os.path.normcase(path) in have:
+                continue
+            iid = f'f{self._n}'
+            self._n += 1
+            self.files[iid] = {'src': path, 'dst': None, 'state': 'ready'}
+            have.add(os.path.normcase(path))
+            try:
+                size = human_bytes(os.path.getsize(path))
+            except OSError:
+                size = ''
+            self.tree.insert('', 'end', iid=iid, values=(path, size, 'Ready'))
+            added += 1
+        if added:
+            self.status.set(f'{len(self.files)} file{"s" if len(self.files) != 1 else ""} — choose what to '
+                            'convert to, then press Convert')
+        return added
+
+    def _pick(self):
+        exts = ' '.join(f'*.{e}' for e in sorted(MEDIA_EXTS))
+        paths = filedialog.askopenfilenames(parent=self, title='Files to convert',
+                                            filetypes=[('Audio and video', exts), ('All files', '*.*')])
+        self.add_files(paths)
+
+    def _enable_drop(self):
+        try:
+            cmd = self.register(lambda data: (self.add_files(
+                [p for p in self.tk.splitlist(data) if os.path.isfile(p)]), 'copy')[1])
+            self.tk.call('tkdnd::drop_target', 'register', self.tree._w, ('DND_Files',))
+            self.tk.call('bind', self.tree._w, '<<Drop>>', cmd + ' %D')
+        except tk.TclError:
+            pass
+
+    def _remove(self):
+        for iid in self.tree.selection():
+            if self.files.get(iid, {}).get('state') != 'working':
+                self.tree.delete(iid)
+                self.files.pop(iid, None)
+
+    def _clear(self):
+        for iid in list(self.files):
+            if self.files[iid]['state'] != 'working':
+                self.tree.delete(iid)
+                self.files.pop(iid)
+
+    # ----- options -----
+    def _on_preset(self):
+        lossy = CONVERT_PRESETS[self.preset.get()][2]
+        self.cb_q.configure(state='readonly' if lossy else 'disabled')
+
+    def _on_dest(self):
+        st = 'disabled' if self.same_folder.get() else 'normal'
+        self.ent_folder.configure(state=st)
+        self.btn_folder.configure(state=st)
+
+    def _browse(self):
+        d = filedialog.askdirectory(parent=self, initialdir=self.folder.get() or None)
+        if d:
+            self.folder.set(d)
+
+    # ----- converting -----
+    def _go(self):
+        if self.running:
+            return
+        rows = self.tree.get_children()
+        todo = [iid for iid in rows if self.files[iid]['state'] in ('ready', 'error', 'stopped')]
+        if not todo:  # everything is converted already: convert it all again (e.g. to another format)
+            todo = [iid for iid in rows if self.files[iid]['state'] == 'done']
+        if not todo:
+            self.status.set('Nothing to convert — add some files first')
+            return
+        folder = None
+        if not self.same_folder.get():
+            folder = self.folder.get().strip()
+            if not folder:
+                messagebox.showinfo(APP_NAME, 'Choose a folder to save the converted files in.', parent=self)
+                return
+            os.makedirs(folder, exist_ok=True)
+        name = self.preset.get()
+        ext, _audio, _lossy, build = CONVERT_PRESETS[name]
+        args = build(self.quality.get())
+        self.app.settings.update(convert_preset=name, convert_quality=self.quality.get(),
+                                 convert_same_folder=self.same_folder.get(), convert_folder=self.folder.get())
+        self.stop.clear()
+        self.running = True
+        self.btn_go.configure(state='disabled')
+        self.btn_stop.configure(state='normal')
+        for iid in todo:
+            self.files[iid]['state'] = 'queued'
+            self.tree.set(iid, 'status', 'Waiting…')
+            self.tree.item(iid, tags=())
+
+        def work():
+            done = failed = 0
+            for iid in todo:
+                if self.stop.is_set():
+                    self.q.put(('state', iid, 'stopped', 'Stopped'))
+                    continue
+                src = self.files[iid]['src']
+                dst = convert_target(src, ext, folder)
+                self.q.put(('state', iid, 'working', 'Converting…'))
+                try:
+                    convert_file(src, dst, args, lambda f, iid=iid: self.q.put(('pct', iid, f, None)), self.stop)
+                    self.files[iid]['dst'] = dst
+                    self.q.put(('state', iid, 'done', f'✔ {os.path.basename(dst)}'))
+                    done += 1
+                except DownloadCancelled:
+                    self.q.put(('state', iid, 'stopped', 'Stopped'))
+                except Exception as e:
+                    self.q.put(('state', iid, 'error', f'Failed: {e}'))
+                    failed += 1
+            self.q.put(('finished', None, (done, failed), None))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _pump(self):
+        try:
+            while True:
+                kind, iid, a, b = self.q.get_nowait()
+                if kind == 'pct' and self.tree.exists(iid):
+                    self.tree.set(iid, 'status', f'Converting… {a * 100:.0f}%')
+                elif kind == 'state' and iid in self.files:
+                    self.files[iid]['state'] = a
+                    if self.tree.exists(iid):
+                        self.tree.set(iid, 'status', b)
+                        self.tree.item(iid, tags=('done',) if a == 'done' else ('err',) if a == 'error' else ())
+                elif kind == 'finished':
+                    done, failed = a
+                    self.running = False
+                    self.btn_go.configure(state='normal')
+                    self.btn_stop.configure(state='disabled')
+                    self.status.set(f'Converted {done} file{"s" if done != 1 else ""}'
+                                    + (f', {failed} failed (see the Status column)' if failed else '')
+                                    + (' — stopped' if self.stop.is_set() else ''))
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(80, self._pump)
+
+    # ----- after -----
+    def _result(self, iid):
+        f = self.files.get(iid) or {}
+        return f.get('dst') if f.get('state') == 'done' and f.get('dst') and os.path.exists(f['dst']) else None
+
+    def _open(self):
+        sel = self.tree.selection()
+        if sel:
+            open_path(self._result(sel[0]) or self.files[sel[0]]['src'])
+
+    def _menu(self, ev):
+        iid = self.tree.identify_row(ev.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        res, src = self._result(iid), self.files[iid]['src']
+        p = self.app.palette
+        m = tk.Menu(self, tearoff=0, background=p['surface'], foreground=p['fg'],
+                    activebackground=p['accent'], activeforeground=p['on_accent'])
+        if res:
+            m.add_command(label='Play / open the converted file', command=lambda: open_path(res))
+            m.add_command(label='Show the converted file in its folder', command=lambda: self.app._show_in_folder(res))
+            m.add_separator()
+        m.add_command(label='Open the original', command=lambda: open_path(src))
+        m.add_command(label='Remove from this list', command=self._remove)
+        try:
+            m.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            m.grab_release()
+
+    def _close(self):
+        if self.running:
+            if not messagebox.askyesno(APP_NAME, 'Files are still converting. Stop and close?', parent=self):
+                return
+            self.stop.set()
+        self.destroy()
+
+
 class Tray:
     """System-tray icon (pystray): 'downloads finished' notifications and a place to minimize to.
     Quietly does nothing if pystray isn't available (e.g. running from source without it)."""
@@ -3184,6 +3993,7 @@ class App(tk.Tk):
         self.rows = {}
         self.settings = dict(DEFAULTS)
         self.format_overrides = {}  # link -> exact yt-dlp format chosen in the Formats window
+        self.item_picks = {}        # playlist link -> ids of the items ticked in the playlist picker
         self._col_widths = {}
         self._skipped = 0
         self.tray = Tray(self)
@@ -3202,6 +4012,7 @@ class App(tk.Tk):
         self.after(100, self._poll)
         self.after(2000, lambda: self._check_updates(quiet=True))
         self.after(8000, remove_old_name_copy)
+        self.after(400, self._restore_pending)
         self._clip_last = self._read_clipboard()
         self.after(700, self._poll_clipboard)
         self._enable_drag_and_drop()
@@ -3391,8 +4202,11 @@ class App(tk.Tk):
         ttk.Button(top, text='Clear', command=lambda: self.url_text.delete('1.0', 'end')).grid(
             row=1, column=1, sticky='ew', padx=(8, 0), pady=4)
         ttk.Button(top, text='From file…', command=self._load_urls).grid(row=2, column=1, sticky='ew', padx=(8, 0))
-        ttk.Button(top, text='Formats…', command=self._open_formats).grid(row=3, column=1, sticky='ew', padx=(8, 0),
-                                                                           pady=(4, 0))
+        fb = ttk.Frame(top)
+        fb.grid(row=3, column=1, sticky='ew', padx=(8, 0), pady=(4, 0))
+        ttk.Button(fb, text='Formats…', command=self._open_formats).pack(side='left', fill='x', expand=True)
+        ttk.Button(fb, text='Pick items…', command=self._open_picker).pack(side='left', fill='x', expand=True,
+                                                                           padx=(4, 0))
         self.watch_clipboard = tk.BooleanVar()
         self.preview_volume = tk.DoubleVar()  # used by the Preview & clip window
         self.clear_done = tk.BooleanVar()
@@ -3491,6 +4305,10 @@ class App(tk.Tk):
         self.go_easy_youtube = tk.BooleanVar()
         ttk.Checkbutton(ext, text='Go easy on YouTube (pauses, max 2 at once — avoids the "not a bot" block)',
                         variable=self.go_easy_youtube).grid(row=9, column=0, columnspan=2, sticky='w', pady=(2, 0))
+        self.pick_playlist_items = tk.BooleanVar()
+        ttk.Checkbutton(ext, text='Let me pick which items to get when I add a playlist, album or channel',
+                        variable=self.pick_playlist_items).grid(row=11, column=0, columnspan=2, sticky='w',
+                                                                 pady=(2, 0))
         self.notify_done = tk.BooleanVar()
         self.notify_sound = tk.BooleanVar()
         self.tray_on_minimize = tk.BooleanVar()
@@ -3570,6 +4388,8 @@ class App(tk.Tk):
         self.dark = tk.BooleanVar()
         ttk.Checkbutton(bar, text='Dark mode', variable=self.dark, command=self._toggle_theme).pack(side='right')
         ttk.Button(bar, text='Updates', command=lambda: self._check_updates(quiet=False)).pack(side='right', padx=(0, 10))
+        ttk.Button(bar, text='Convert…', command=self._open_convert).pack(side='right', padx=(0, 6))
+        ttk.Button(bar, text='Library', command=self._open_library).pack(side='right', padx=(0, 6))
         self.status = tk.StringVar(value='Ready')
         ttk.Label(bar, textvariable=self.status).pack(side='right', padx=(0, 16))
 
@@ -3630,6 +4450,7 @@ class App(tk.Tk):
                 data = json.load(f)
             self.settings.update({k: v for k, v in data.items() if k in DEFAULTS})
             self._col_widths = data.get('col_widths') or {}
+            self.settings.update({k: v for k, v in (data.get('convert') or {}).items() if k.startswith('convert_')})
         except Exception:
             pass
         if not self.settings.get('outdir_audio'):
@@ -3670,6 +4491,7 @@ class App(tk.Tk):
                 data['col_widths'] = {c: int(self.tree.column(c, 'width')) for c in self.tree['columns']}
             except Exception:
                 pass
+            data['convert'] = {k: v for k, v in self.settings.items() if k.startswith('convert_')}
             with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
         except Exception:
@@ -3708,8 +4530,10 @@ class App(tk.Tk):
         except tk.TclError:
             return
         if text:
+            had = set(self._urls())
             cur = self.url_text.get('1.0', 'end').strip()
             self.url_text.insert('end', ('\n' if cur else '') + text)
+            self._maybe_pick([u for u in self._urls() if u not in had])
 
     def _load_urls(self):
         p = filedialog.askopenfilename(filetypes=[('Text files', '*.txt'), ('All files', '*.*')])
@@ -3732,6 +4556,7 @@ class App(tk.Tk):
         gone = set(urls)
         for u in gone:
             self.format_overrides.pop(u, None)
+            self.item_picks.pop(u, None)
         lines = self.url_text.get('1.0', 'end-1c').splitlines()
         keep = [l for l in lines if l.strip() not in gone]
         removed = len(lines) - len(keep)
@@ -3827,8 +4652,11 @@ class App(tk.Tk):
                       f'{GO_EASY_MAX_PARALLEL} at a time (turn off under Options)')
         self.worker = Worker(urls, args, self.q, parallel=n, args_whole=args_whole, clip_confirmed=clip_confirmed,
                              clean_on_cancel=s.get('clean_on_cancel', True),
-                             format_overrides={u: f for u, f in self.format_overrides.items() if u in urls})
+                             format_overrides={u: f for u, f in self.format_overrides.items() if u in urls},
+                             item_picks={u: set(ids) for u, ids in self.item_picks.items() if u in urls})
         self.worker.start()
+        if not jobs:  # a new batch (retries are re-runs of this one): remember it until it finishes
+            save_pending('batch', urls, self.format_overrides, self.item_picks)
 
     def _ask_clip_many(self, what, clip):
         """True = clip every item, False = download them whole, None = cancel."""
@@ -4004,12 +4832,18 @@ class App(tk.Tk):
 
     def _on_close(self):
         self._save_settings()
-        if self.worker and self.worker.is_alive():
+        busy = bool(self.worker and self.worker.is_alive())
+        if busy:
             if self.state() == 'withdrawn':
                 self._show_from_tray()
-            if not messagebox.askyesno(APP_NAME, 'A download is running. Cancel it and quit?'):
+            if not messagebox.askyesno(APP_NAME, 'A download is running. Stop it and quit?\n\n'
+                                       'The unfinished links will be back next time you open Grabbit.'):
                 return
             self.worker.cancel.set()
+        # links still in the box (and an interrupted batch) come back next time
+        was = load_pending() or {}
+        urls = self._urls() + (was.get('urls', []) if busy else [])
+        save_pending('batch' if busy else 'list', urls, self.format_overrides, self.item_picks)
         self.tray.stop()
         self.destroy()
 
@@ -4081,14 +4915,37 @@ class App(tk.Tk):
         FormatsWindow(self, url)
 
     def _show_overrides(self):
-        n = len([u for u in self.format_overrides if u in set(self._urls())])
-        self.lbl_overrides.configure(text=f'Exact quality set for {n} link{"s" if n != 1 else ""}  ✕' if n else '')
+        have = set(self._urls())
+        n = len([u for u in self.format_overrides if u in have])
+        k = len([u for u in self.item_picks if u in have])
+        parts = ([f'Exact quality for {n} link{"s" if n != 1 else ""}'] if n else []) + (
+            [f'Picked items in {k} playlist{"s" if k != 1 else ""}'] if k else [])
+        self.lbl_overrides.configure(text='  ·  '.join(parts) + '  ✕' if parts else '')
 
     def _clear_overrides(self):
-        if self.format_overrides and messagebox.askyesno(
-                APP_NAME, 'Go back to automatic quality for every link?', parent=self):
+        if (self.format_overrides or self.item_picks) and messagebox.askyesno(
+                APP_NAME, 'Go back to automatic quality, and to every item in each playlist?', parent=self):
             self.format_overrides.clear()
+            self.item_picks.clear()
             self._show_overrides()
+
+    def _open_picker(self, url=None):
+        url = url or self._link_at_cursor()
+        if not url:
+            messagebox.showinfo(APP_NAME, 'Paste a playlist, album or channel link first (click on its line to '
+                                'pick it), then click Pick items.', parent=self)
+            return
+        PlaylistPicker(self, url)
+
+    def _maybe_pick(self, urls):
+        """New links were added: open the picker for the ones that are clearly playlists (a few at most)."""
+        if not self.pick_playlist_items.get():
+            return
+        lists = [u for u in urls if looks_like_playlist(u) and u not in self.item_picks]
+        for u in lists[:3]:
+            PlaylistPicker(self, u)
+        if len(lists) > 3:
+            self._log(f'{len(lists) - 3} more playlist link(s) added — use "Pick items…" to choose from them')
 
     def _open_preview(self):
         urls = self._urls()
@@ -4106,6 +4963,45 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, 'Previews need FFmpeg, which was not found next to the app.', parent=self)
             return
         PreviewWindow(self, url)
+
+    def _restore_pending(self):
+        """Put back links from last time: ones left in the box, or a batch that never finished."""
+        data = load_pending()
+        if not data:
+            return
+        save_pending('list', [])
+        urls = [u for u in data.get('urls', []) if isinstance(u, str) and u.strip()]
+        if not urls:
+            return
+        self.format_overrides.update({u: f for u, f in (data.get('format_overrides') or {}).items() if u in urls})
+        self.item_picks.update({u: set(ids) for u, ids in (data.get('item_picks') or {}).items() if u in urls})
+        n = self._add_urls(urls, 'last time')
+        self._show_overrides()
+        if data.get('kind') == 'batch' and n:
+            self.status.set(f'{n} unfinished link(s) from last time are back in the list')
+            if messagebox.askyesno(APP_NAME, f'Grabbit closed before it finished downloading {n} link'
+                                   f'{"s" if n != 1 else ""} last time.\n\nPick up where it left off now? '
+                                   'Things that already finished are skipped.\n\n(Choose No to just keep them in '
+                                   'the list.)', parent=self):
+                self._start()
+
+    def _open_convert(self, files=()):
+        w = getattr(self, '_convert_win', None)
+        if w is not None and w.winfo_exists():
+            w.add_files(files)
+            w.deiconify()
+            w.lift()
+            return
+        self._convert_win = ConvertWindow(self, files)
+
+    def _open_library(self):
+        w = getattr(self, '_library_win', None)
+        if w is not None and w.winfo_exists():
+            w.reload()
+            w.deiconify()
+            w.lift()
+            return
+        self._library_win = LibraryWindow(self)
 
     def _open_search(self):
         q, site = self.search_query.get().strip(), self.search_site.get()
@@ -4132,6 +5028,8 @@ class App(tk.Tk):
         what = f'{len(new)} link' + ('s' if len(new) != 1 else '')
         self.status.set(f'Added {what} from {source}')
         self._log(f'Added {what} from {source}: ' + ', '.join(new[:3]) + (' …' if len(new) > 3 else ''))
+        if source not in ('the playlist picker', 'last time'):
+            self._maybe_pick(new)
         return len(new)
 
     def _read_clipboard(self):
@@ -4181,6 +5079,16 @@ class App(tk.Tk):
         return ok
 
     def _on_drop(self, data):
+        try:
+            items = list(self.tk.splitlist(data))
+        except tk.TclError:
+            items = []
+        media = [i for i in items if os.path.isfile(i) and os.path.splitext(i)[1].lstrip('.').lower() in MEDIA_EXTS]
+        if media:  # audio/video files from this computer: offer to convert them
+            self._open_convert(media)
+            if len(media) == len(items):
+                return 'copy'
+            data = ' '.join('{%s}' % i for i in items if i not in media)
         urls = urls_from_drop(data, self.tk.splitlist)
         if urls:
             if not self._add_urls(urls, 'drag and drop'):
@@ -4385,6 +5293,14 @@ class App(tk.Tk):
                     self.row_jobs.pop(iid, None)
                     self._skipped += 1
                 elif kind == 'done_item':
+                    if data.get('path'):
+                        library_add({'t': int(time.time()), 'title': data.get('title') or
+                                     os.path.splitext(os.path.basename(data['path']))[0], 'url': data.get('url'),
+                                     'path': os.path.abspath(data['path']), 'site': data.get('site') or '',
+                                     'archive': data.get('archive')})
+                        w = getattr(self, '_library_win', None)
+                        if w is not None and w.winfo_exists():
+                            w.reload()
                     iid = self._row(data['key'])
                     self.tree.set(iid, 'status', '✔ Done')
                     self.tree.set(iid, 'progress', '100%')
@@ -4444,6 +5360,7 @@ class App(tk.Tk):
                     elif data == 'quit':
                         self._on_close()
                 elif kind == 'finished':
+                    save_pending('list', [])  # the batch ran to the end (or was cancelled on purpose)
                     self.btn_go.configure(state='normal')
                     self.btn_cancel.configure(state='disabled')
                     self.btn_retry.configure(state='normal' if self._failed_rows() else 'disabled')

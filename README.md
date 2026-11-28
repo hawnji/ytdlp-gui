@@ -9,6 +9,9 @@ A desktop downloader for Windows built on [yt-dlp](https://github.com/yt-dlp/yt-
 - Preview & clip: scrub a video or song, listen, and download just the part you want
 - Search YouTube, YouTube Music and SoundCloud from inside the app
 - Pick an exact quality per link, see the file name before you download
+- Pick which songs or videos to get from a playlist, album or channel
+- A library of everything you've downloaded, and unfinished downloads come back after a restart
+- Convert files on your computer (pull the audio out of a video, change formats)
 - Clipboard watching, drag and drop, dark mode, tray notifications, automatic updates
 
 ## Get it
