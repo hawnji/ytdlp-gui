@@ -2700,8 +2700,8 @@ class SearchWindow(tk.Toplevel):
         p = app.palette
         self.title('Search')
         self.configure(bg=p['bg'])
-        self.geometry('1000x660')
-        self.minsize(760, 460)
+        self.geometry(f'1000x{min(660, self.winfo_screenheight() - 120)}')
+        self.minsize(760, 360)
         self.q = queue.Queue()
         self.results, self.images, self.n = [], {}, self.STEP
         self._gen = 0
@@ -2720,11 +2720,31 @@ class SearchWindow(tk.Toplevel):
             side='left', padx=6)
         ttk.Button(top, text='Search', style='Accent.TButton', command=self.search).pack(side='left')
 
+        # the buttons are packed first so they always stay visible; the result list gets the space left over
+        bot = ttk.Frame(outer)
+        self.status = tk.StringVar(value='Type something and press Enter.')
+        ttk.Label(bot, textvariable=self.status).pack(side='left')
+        self.btn_now = ttk.Button(bot, text='Download checked', style='Accent.TButton',
+                                  command=lambda: self._add(True), state='disabled')
+        self.btn_now.pack(side='right')
+        self.btn_add = ttk.Button(bot, text='Add checked to list', command=lambda: self._add(False),
+                                  state='disabled')
+        self.btn_add.pack(side='right', padx=6)
+        self.btn_more = ttk.Button(bot, text='Load more', command=self.more, state='disabled')
+        self.btn_more.pack(side='right', padx=(0, 12))
+        self.btn_all = ttk.Button(bot, text='Check all', width=11, command=self._toggle_all)
+        self.btn_all.pack(side='right')
+        ttk.Label(outer, style='Hint.TLabel',
+                  text='Click a result to tick it (Shift-click ticks everything in between) · '
+                       'right-click to preview, check formats or open in your browser').pack(
+            side='bottom', anchor='w', pady=(6, 0))
+        bot.pack(side='bottom', fill='x')
+
         mid = ttk.Frame(outer)
         mid.pack(fill='both', expand=True, pady=8)
         ttk.Style(self).configure('Search.Treeview', rowheight=74)
         self.tree = ttk.Treeview(mid, columns=('pick', 'title', 'channel', 'length', 'views'), show='tree headings',
-                                 selectmode='none', style='Search.Treeview')
+                                 selectmode='none', style='Search.Treeview', height=5)
         self.tree.heading('#0', text='')
         self.tree.column('#0', width=136, stretch=False)
         self.tree.heading('pick', text='☐', command=self._toggle_all)
@@ -2743,23 +2763,6 @@ class SearchWindow(tk.Toplevel):
         self.tree.bind('<Shift-Button-1>', lambda e: self._click(e, shift=True))
         self.tree.bind('<Button-3>', self._menu)
 
-        bot = ttk.Frame(outer)
-        bot.pack(fill='x')
-        self.status = tk.StringVar(value='Type something and press Enter.')
-        ttk.Label(bot, textvariable=self.status).pack(side='left')
-        self.btn_now = ttk.Button(bot, text='Download checked', style='Accent.TButton',
-                                  command=lambda: self._add(True), state='disabled')
-        self.btn_now.pack(side='right')
-        self.btn_add = ttk.Button(bot, text='Add checked to list', command=lambda: self._add(False),
-                                  state='disabled')
-        self.btn_add.pack(side='right', padx=6)
-        self.btn_more = ttk.Button(bot, text='Load more', command=self.more, state='disabled')
-        self.btn_more.pack(side='right', padx=(0, 12))
-        self.btn_all = ttk.Button(bot, text='Check all', width=11, command=self._toggle_all)
-        self.btn_all.pack(side='right')
-        ttk.Label(outer, style='Hint.TLabel',
-                  text='Click a result to tick it (Shift-click ticks everything in between) · '
-                       'right-click to preview, check formats or open in your browser').pack(anchor='w', pady=(6, 0))
         app._set_titlebar(self)
         ent.focus_set()
         self.after(60, self._pump)
