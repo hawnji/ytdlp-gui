@@ -61,6 +61,41 @@ from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.utils import ExtractorError, float_or_none, parse_iso8601, traverse_obj, url_or_none
 
 
+_SUNO_CLERK = ('https://auth.suno.com', 'https://clerk.suno.com')  # Suno's login service (Clerk)
+_SUNO_CLERK_JS = '5.117.0'
+_SUNO_HEADERS = {'Origin': 'https://suno.com', 'Referer': 'https://suno.com/'}
+SUNO_LOGIN_HELP = ('To get songs from your own Suno library (including unpublished ones), log in to suno.com in your '
+                   'browser, then pick that browser under "Cookies from browser" in Grabbit and try again. '
+                   'Firefox works best — Chrome and Edge often lock their cookies while they are open.')
+
+
+def suno_token(ie):
+    """A short-lived login token for the Suno account in the browser cookies Grabbit was given, or None.
+    Suno uses Clerk for logins: the long-lived __client cookie is swapped for a token that lasts about a minute."""
+    ydl = ie._downloader
+    cached = getattr(ydl, '_suno_token', None)
+    if cached and time.time() - cached[1] < 40:
+        return cached[0]
+    q = {'_clerk_js_version': _SUNO_CLERK_JS}
+    for base in _SUNO_CLERK:
+        data = ie._download_json(f'{base}/v1/client', None, 'Checking your Suno login', query=q,
+                                 headers=_SUNO_HEADERS, fatal=False, expected_status=(401, 403, 404)) or {}
+        resp = data.get('response') or {}
+        sid = resp.get('last_active_session_id') or traverse_obj(resp, ('sessions', 0, 'id'))
+        if not sid:
+            continue
+        tok = ie._download_json(f'{base}/v1/client/sessions/{sid}/tokens', None, 'Getting a Suno login token',
+                                query=q, data=b'',
+                                headers={**_SUNO_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded'},
+                                fatal=False,
+                                expected_status=(401, 403, 404)) or {}
+        jwt = tok.get('jwt') or traverse_obj(resp, ('sessions', 0, 'last_active_token', 'jwt'))
+        if jwt:
+            ydl._suno_token = (jwt, time.time())
+            return jwt
+    return None
+
+
 class SunoIE(InfoExtractor):
     """Suno songs. yt-dlp deliberately ships without Suno support, so the GUI adds it."""
     IE_NAME = 'suno'
@@ -80,7 +115,15 @@ class SunoIE(InfoExtractor):
                 raise ExtractorError('Could not find a song in this Suno link', expected=True)
             song_id = m.group(m.lastindex or 0)
 
-        clip = self._download_json(self._API + song_id, song_id, 'Downloading song info', fatal=False) or {}
+        clip = self._download_json(self._API + song_id, song_id, 'Downloading song info', fatal=False,
+                                   expected_status=(401, 403, 404)) or {}
+        if not clip.get('title') or not clip.get('audio_url'):
+            # unpublished songs only show their details to the owner: ask again logged in, if we can
+            token = suno_token(self)
+            if token:
+                clip = self._download_json(self._API + song_id, song_id, 'Downloading song info (logged in)',
+                                           headers={**_SUNO_HEADERS, 'Authorization': f'Bearer {token}'},
+                                           fatal=False, expected_status=(401, 403, 404)) or clip
         meta = clip.get('metadata') or {}
 
         formats = []
@@ -98,7 +141,8 @@ class SunoIE(InfoExtractor):
                             'vcodec': 'h264', 'acodec': 'aac', 'quality': 0})
         if not formats:
             raise ExtractorError('Suno did not offer a downloadable file for this song '
-                                 '(it may be private, deleted or still generating)', expected=True)
+                                 '(it may be private, deleted or still generating). If it is one of yours: '
+                                 + SUNO_LOGIN_HELP, expected=True)
 
         title = clip.get('title')
         if not title:
@@ -199,6 +243,41 @@ class SunoProfileIE(InfoExtractor):
             uploader_url=f'https://suno.com/@{handle}', webpage_url=f'https://suno.com/@{handle}')
 
 
+class SunoLibraryIE(InfoExtractor):
+    """Your own Suno library — published and unpublished songs, newest first. Needs browser cookies.
+    Links: suno.com/me, suno.com/library, suno.com/create (the pages Suno shows your songs on)."""
+    IE_NAME = 'suno:library'
+    _VALID_URL = r'https?://(?:www\.|app\.)?suno\.com/(?P<id>me|library|create)/?(?:[?#].*)?$'
+    _FEED = 'https://studio-api.prod.suno.com/api/feed/v2'
+
+    def _real_extract(self, url):
+        entries, seen, total = [], set(), None
+        for page in range(0, 500):
+            token = suno_token(self)  # tokens only last about a minute, so refresh as we go
+            if not token:
+                raise ExtractorError(SUNO_LOGIN_HELP, expected=True)
+            data = self._download_json(
+                self._FEED, 'library', f'Downloading your song list, page {page + 1}', query={'page': page},
+                headers={**_SUNO_HEADERS, 'Authorization': f'Bearer {token}'})
+            clips = data.get('clips') if isinstance(data, dict) else data
+            new = [c for c in clips or [] if isinstance(c, dict) and c.get('id') and c['id'] not in seen]
+            for c in new:
+                seen.add(c['id'])
+                if c.get('is_trashed') or c.get('status') not in (None, 'complete', 'streaming'):
+                    continue  # in the bin, failed, or still generating
+                entries.append(self.url_result(
+                    f'https://suno.com/song/{c["id"]}', SunoIE, c['id'], c.get('title'),
+                    duration=float_or_none((c.get('metadata') or {}).get('duration')),
+                    uploader=c.get('display_name')))
+            total = (data.get('num_total_results') if isinstance(data, dict) else None) or total
+            if not new or (total and len(seen) >= total):
+                break
+        if not entries:
+            raise ExtractorError('No songs found in your Suno library', expected=True)
+        return self.playlist_result(entries, 'suno-library', 'My Suno songs',
+                                    webpage_url='https://suno.com/me')
+
+
 def _walk(obj, key):
     """Every value stored under `key` anywhere inside nested dicts/lists, in order."""
     stack = [obj]
@@ -283,7 +362,7 @@ except Exception:  # a future yt-dlp may move these internals; then simply do wi
     _YTM_EXTRACTORS = ()
 
 
-EXTRA_EXTRACTORS = (SunoIE, SunoPlaylistIE, SunoProfileIE, *_YTM_EXTRACTORS)
+EXTRA_EXTRACTORS = (SunoIE, SunoPlaylistIE, SunoProfileIE, SunoLibraryIE, *_YTM_EXTRACTORS)
 
 
 def make_ydl(opts):
