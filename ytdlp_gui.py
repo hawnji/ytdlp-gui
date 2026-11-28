@@ -90,6 +90,8 @@ def suno_login_problem(ie):
                 f'logged in to suno.com in {browser.title()} (not another browser or profile). If it is Chrome or '
                 'Edge, close it completely and try again, or use Firefox.')
     trail = getattr(ydl, '_suno_trail', [])
+    if not any(t.startswith(('login', 'logged in')) for t in trail) and not getattr(ydl, '_suno_token', None):
+        trail = trail + ['the login was not tried']
     what = (' What Grabbit tried: ' + '; '.join(trail[-10:]) + '.') if trail else ''
     if getattr(ydl, '_suno_token', None):
         return 'Your Suno login worked, but Suno still did not hand over this song.' + what
@@ -205,22 +207,26 @@ class SunoIE(InfoExtractor):
 
         self._downloader._suno_trail = []  # what happened, for this song's error message
         clip = suno_api(self, f'/api/clip/{song_id}', song_id, 'Downloading song info') or {}
-        private = not clip.get('title') or not clip.get('audio_url')
+        def playable(c):
+            a = c.get('audio_url') or ''
+            return a.startswith('http') and 'forbidden' not in a  # private songs get a fake '…/forbidden' link
+
+        private = not clip.get('title') or not playable(clip)
         if private:
             # unpublished songs only show their details to the owner: ask again logged in, if we can
             token = suno_token(self)
             if token:
                 got = (suno_api(self, f'/api/clip/{song_id}', song_id, 'Downloading song info (logged in)', token)
                        or {})
-                if not got.get('audio_url'):
+                if not playable(got):
                     feed = suno_api(self, '/api/feed/v2', song_id, 'Looking the song up in your library', token,
                                     query={'ids': song_id})
                     got = next((c for c in ((feed or {}).get('clips') if isinstance(feed, dict) else feed) or []
-                                if isinstance(c, dict) and c.get('id') == song_id), got)
-                if got and not got.get('audio_url'):
+                                if isinstance(c, dict) and c.get('id') == song_id and playable(c)), got)
+                if got and not playable(got):
                     self._downloader._suno_trail.append(
                         f'found the song ({got.get("status") or "no status"}) but no audio link')
-                clip = got or clip
+                clip = got if got.get('title') else clip
         meta = clip.get('metadata') or {}
 
         formats = []
