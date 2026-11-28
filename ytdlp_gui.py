@@ -58,7 +58,8 @@ except ImportError:
 
 import re
 from yt_dlp.extractor.common import InfoExtractor
-from yt_dlp.utils import ExtractorError, float_or_none, make_archive_id, parse_iso8601, traverse_obj, url_or_none
+from yt_dlp.utils import (ExtractorError, float_or_none, make_archive_id, parse_count, parse_duration,
+                          parse_iso8601, traverse_obj, url_or_none)
 
 
 _SUNO_CLERK = ('https://auth.suno.com', 'https://clerk.suno.com')  # Suno's login service (Clerk)
@@ -541,6 +542,76 @@ try:
             return self.playlist_result(entries, list_id, title or 'YouTube Music radio')
 
     _YTM_EXTRACTORS = (YouTubeMusicRadioIE,)
+
+    from yt_dlp.extractor.youtube import YoutubeMusicSearchURLIE
+
+    def ytm_song_details(renderer):
+        """Artist(s), album, length, plays, explicit and cover art from a YouTube Music search result row.
+        (yt-dlp keeps only the title; the rest is in the row's text, e.g. "Artist • Album • 3:45".)"""
+        out = {}
+        cols = traverse_obj(renderer, ('flexColumns', ..., 'musicResponsiveListItemFlexColumnRenderer', 'text',
+                                       'runs')) or []
+        artists = []
+        for runs in cols[1:]:
+            for r in runs or []:
+                text = (r.get('text') or '').strip()
+                kind = traverse_obj(r, ('navigationEndpoint', 'browseEndpoint', 'browseEndpointContextSupportedConfigs',
+                                        'browseEndpointContextMusicConfig', 'pageType')) or ''
+                if not text or text == '•':
+                    continue
+                if 'ARTIST' in kind or 'USER_CHANNEL' in kind:
+                    artists.append(text)
+                elif 'ALBUM' in kind:
+                    out['album'] = text
+                elif re.fullmatch(r'\d{1,2}(?::\d{2}){1,2}', text):
+                    out['duration'] = parse_duration(text)
+                elif re.search(r'\b(?:plays?|views?)$', text, re.I):
+                    out['view_count'] = parse_count(re.sub(r'\s*(?:plays?|views?)$', '', text, flags=re.I))
+        if not artists:  # older layout: plain text "Artist • Album • 3:45"
+            plain = [t.strip() for t in ''.join(r.get('text') or '' for r in (cols[1] if len(cols) > 1 else [])
+                                                ).split('•') if t.strip()]
+            rest = []
+            for t in plain:
+                if t.lower() in ('song', 'video', 'single', 'ep', 'album'):
+                    continue
+                if re.fullmatch(r'\d{1,2}(?::\d{2}){1,2}', t):
+                    out.setdefault('duration', parse_duration(t))
+                elif re.search(r'\b(?:plays?|views?)$', t, re.I):
+                    out.setdefault('view_count', parse_count(re.sub(r'\s*(?:plays?|views?)$', '', t, flags=re.I)))
+                else:
+                    rest.append(t)
+            if rest:
+                artists = [rest[0]]
+                if len(rest) > 1:
+                    out.setdefault('album', rest[1])
+        if artists:
+            out['artists'] = list(dict.fromkeys(a for a in artists if a.lower() != 'song'))
+        badges = traverse_obj(renderer, (('badges', 'subtitleBadges'), ..., 'musicInlineBadgeRenderer', 'icon',
+                                         'iconType')) or []
+        if 'MUSIC_EXPLICIT_BADGE' in badges:
+            out['explicit'] = True
+        thumbs = traverse_obj(renderer, ('thumbnail', 'musicThumbnailRenderer', 'thumbnail', 'thumbnails',
+                                         lambda _, v: v.get('url'))) or []
+        if thumbs:
+            # square cover art; ask for a size that looks sharp in the results list
+            url = re.sub(r'=w\d+-h\d+', '=w240-h240', thumbs[-1]['url'])
+            out['thumbnails'] = [{'url': url, 'width': 240, 'height': 240}]
+        return out
+
+    class YouTubeMusicSearchIE(YoutubeMusicSearchURLIE):
+        """YouTube Music search, keeping each song's artist, album, length, plays and cover art."""
+        IE_NAME = 'youtube:music:search_url+'
+
+        def _music_reponsive_list_entry(self, renderer):
+            entry = super()._music_reponsive_list_entry(renderer)
+            if entry and entry.get('ie_key') == YoutubeIE.ie_key():
+                try:
+                    entry.update(ytm_song_details(renderer))
+                except Exception:
+                    pass  # the extras are nice to have; the song itself still works
+            return entry
+
+    _YTM_EXTRACTORS += (YouTubeMusicSearchIE,)
 except Exception:  # a future yt-dlp may move these internals; then simply do without this extra
     _YTM_EXTRACTORS = ()
 
@@ -2952,13 +3023,15 @@ def normalize_entries(entries, n=None):
         url = f'https://www.youtube.com/watch?v={vid}' if youtube and vid else (e.get('webpage_url') or e.get('url'))
         if not url:
             continue
-        thumb = (f'https://i.ytimg.com/vi/{vid}/mqdefault.jpg' if youtube and vid
-                 else e.get('thumbnail') or _pick_thumb(e.get('thumbnails')))
+        cover = e.get('thumbnail') or _pick_thumb(e.get('thumbnails'))
+        thumb = (cover if youtube and cover and 'googleusercontent' in cover  # YouTube Music album art
+                 else f'https://i.ytimg.com/vi/{vid}/mqdefault.jpg' if youtube and vid else cover)
+        artists = [a for a in e.get('artists') or [] if isinstance(a, str)]
         results.append({
             'url': url, 'id': vid, 'ie': ie or ('Youtube' if youtube else ''), 'title': e.get('title') or url,
-            'channel': e.get('channel') or e.get('uploader') or traverse_obj(e, ('artists', 0)) or '',
+            'channel': e.get('channel') or e.get('uploader') or ', '.join(artists) or '',
             'duration': e.get('duration'), 'views': e.get('view_count'), 'thumb': thumb,
-            'date': _entry_date(e),
+            'date': _entry_date(e), 'album': e.get('album') or '', 'explicit': bool(e.get('explicit')),
         })
         if n and len(results) >= n:
             break
@@ -3104,7 +3177,7 @@ class SearchWindow(tk.Toplevel):
         mid = ttk.Frame(outer)
         mid.pack(fill='both', expand=True, pady=8)
         ttk.Style(self).configure('Search.Treeview', rowheight=74)
-        self.tree = ttk.Treeview(mid, columns=('pick', 'title', 'channel', 'added', 'length', 'views'),
+        self.tree = ttk.Treeview(mid, columns=('pick', 'title', 'channel', 'album', 'added', 'length', 'views'),
                                  show='tree headings',
                                  selectmode='none', style='Search.Treeview', height=5)
         self.tree.heading('#0', text='')
@@ -3115,9 +3188,10 @@ class SearchWindow(tk.Toplevel):
         self.tree.tag_configure('added', foreground=p['muted'])
         self.checked, self.added, self._anchor = set(), set(), None
         self._sort = (None, False)  # (column, descending); None = the site's own order
-        for c, w, a in (('title', 380, 'w'), ('channel', 160, 'w'), ('added', 90, 'center'), ('length', 70, 'e'),
-                        ('views', 70, 'e')):
-            self.tree.heading(c, text=c.capitalize(), command=lambda c=c: self._sort_by(c))
+        self._labels = dict(self.LABELS)
+        for c, w, a in (('title', 360, 'w'), ('channel', 150, 'w'), ('album', 150, 'w'), ('added', 90, 'center'),
+                        ('length', 70, 'e'), ('views', 70, 'e')):
+            self.tree.heading(c, text=self._labels[c], command=lambda c=c: self._sort_by(c))
             self.tree.column(c, width=w, anchor=a, stretch=(c == 'title'))
         sb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
@@ -3126,6 +3200,22 @@ class SearchWindow(tk.Toplevel):
         self.tree.bind('<Button-1>', self._click)
         self.tree.bind('<Shift-Button-1>', lambda e: self._click(e, shift=True))
         self.tree.bind('<Button-3>', self._menu)
+        self._set_columns('')
+
+    LABELS = {'title': 'Title', 'channel': 'Channel', 'album': 'Album', 'added': 'Added', 'length': 'Length',
+              'views': 'Views'}
+
+    def _set_columns(self, site):
+        """YouTube Music: Artist / Album / Plays (it has no upload dates). Everything else: Channel / Added / Views."""
+        music = site.startswith('YouTube Music')
+        self.tree.configure(displaycolumns=('pick', 'title', 'channel', 'album', 'length', 'views') if music
+                            else ('pick', 'title', 'channel', 'added', 'length', 'views'))
+        self._labels = {**self.LABELS, **({'channel': 'Artist', 'views': 'Plays'} if music else {})}
+        if (music and self._sort[0] == 'added') or (not music and self._sort[0] == 'album'):
+            self._sort = (None, False)
+        for c, label in self._labels.items():
+            arrow = (' ▼' if self._sort[1] else ' ▲') if c == self._sort[0] else ''
+            self.tree.heading(c, text=label + arrow)
 
     def search(self, more=False):
         q = self.query.get().strip()
@@ -3138,6 +3228,8 @@ class SearchWindow(tk.Toplevel):
             self.checked, self.added, self._anchor = set(), set(), None
         self._gen += 1
         gen, site, n, settings = self._gen, self.site.get(), self.n, self.app._collect()
+        if not more:
+            self._set_columns(site)
         self.status.set(f'Searching {site} for "{q}"…')
         self.btn_more.configure(state='disabled')
 
@@ -3168,7 +3260,8 @@ class SearchWindow(tk.Toplevel):
                         i = str(len(self.results))
                         self.results.append(r)
                         self.tree.insert('', 'end', iid=i, text='', values=(
-                            '☐', r['title'], r['channel'], r.get('date', ''),
+                            '☐', ('[E] ' if r.get('explicit') else '') + r['title'], r['channel'],
+                            r.get('album', ''), r.get('date', ''),
                             human_eta(r['duration']) if r['duration'] else '',
                             human_count(r['views'])))
                         if r['thumb']:
@@ -3204,6 +3297,7 @@ class SearchWindow(tk.Toplevel):
     _SORT_KEYS = {
         'title': lambda r: (r['title'] or '').casefold(),
         'channel': lambda r: (r['channel'] or '').casefold(),
+        'album': lambda r: (r.get('album') or '').casefold(),
         'added': lambda r: r.get('date') or '',
         'length': lambda r: r['duration'] or 0,
         'views': lambda r: r['views'] or 0,
@@ -3237,7 +3331,7 @@ class SearchWindow(tk.Toplevel):
             self.tree.move(iid, '', n)
         for c in self._SORT_KEYS:
             arrow = (' ▼' if desc else ' ▲') if c == col else ''
-            self.tree.heading(c, text=c.capitalize() + arrow)
+            self.tree.heading(c, text=self._labels[c] + arrow)
         self._anchor = None  # Shift-click ranges follow what's on screen
 
     def _set_checked(self, iid, on):
@@ -3407,7 +3501,7 @@ class PlaylistPicker(SearchWindow):
             iid = str(i)
             self.results.append(r)
             self.tree.insert('', 'end', iid=iid, text='', values=(
-                '☐', r['title'], r['channel'], r.get('date', ''),
+                '☐', r['title'], r['channel'], r.get('album', ''), r.get('date', ''),
                 human_eta(r['duration']) if r['duration'] else '', human_count(r['views'])))
             before = r['id'] and r['ie'] and f"{r['ie'].lower()} {r['id']}" in history
             if before:
