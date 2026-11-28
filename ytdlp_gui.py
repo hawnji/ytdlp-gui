@@ -89,8 +89,37 @@ def suno_login_problem(ie):
         return (f'Grabbit read the cookies from {browser.title()} but found no Suno login in them. Make sure you are '
                 f'logged in to suno.com in {browser.title()} (not another browser or profile). If it is Chrome or '
                 'Edge, close it completely and try again, or use Firefox.')
+    trail = getattr(ydl, '_suno_trail', [])
+    what = (' What Grabbit tried: ' + '; '.join(trail[-10:]) + '.') if trail else ''
+    if getattr(ydl, '_suno_token', None):
+        return 'Your Suno login worked, but Suno still did not hand over this song.' + what
     return ('Your Suno login was found, but Suno refused it (it may have expired). Log out of suno.com and back '
-            'in, then try again.')
+            'in, then try again.' + what)
+
+
+def _suno_json(ie, url, note, step, query=None, data=None, headers=None):
+    """Fetch JSON from Suno like a browser would, noting what happened (for error messages). None on failure."""
+    ydl = ie._downloader
+    trail = ydl.__dict__.setdefault('_suno_trail', [])
+    host = urllib.parse.urlparse(url).netloc.split('.')[0]
+    try:
+        body, urlh = ie._download_webpage_handle(url, None, note, query=query, data=data, headers=headers,
+                                                 expected_status=lambda _: True, impersonate=True)
+        status = urlh.status
+    except Exception as e:
+        trail.append(f'{step} ({host}): {str(e).split(": ", 1)[-1][:80]}')
+        return None
+    try:
+        res = json.loads(body)
+    except ValueError:
+        trail.append(f'{step} ({host}): HTTP {status}, not JSON' + (' (blocked?)' if '<html' in body[:500].lower()
+                                                                    else ''))
+        return None
+    if status >= 400:
+        detail = res.get('detail') or res.get('errors') if isinstance(res, dict) else None
+        trail.append(f'{step} ({host}): HTTP {status}' + (f' {str(detail)[:80]}' if detail else ''))
+        return None
+    return res
 
 
 def suno_token(ie):
@@ -105,19 +134,22 @@ def suno_token(ie):
         return None
     q = {'__clerk_api_version': '2025-11-10', '_clerk_js_version': _SUNO_CLERK_JS}
     h = {**_SUNO_HEADERS, 'Authorization': client}
+    trail = ydl.__dict__.setdefault('_suno_trail', [])
     for base in _SUNO_CLERK:
-        data = ie._download_json(f'{base}/v1/client', None, 'Checking your Suno login', query=q,
-                                 headers=h, fatal=False, expected_status=(401, 403, 404)) or {}
+        data = _suno_json(ie, f'{base}/v1/client', 'Checking your Suno login', 'login check', query=q,
+                          headers=h) or {}
         resp = data.get('response') or {}
         sid = resp.get('last_active_session_id') or traverse_obj(resp, ('sessions', 0, 'id'))
         if not sid:
+            if data:
+                trail.append(f'login check ({base[8:].split(".")[0]}): no active session')
             continue
-        tok = ie._download_json(f'{base}/v1/client/sessions/{sid}/tokens', None, 'Getting a Suno login token',
-                                query=q, data=b'',
-                                headers={**h, 'Content-Type': 'application/x-www-form-urlencoded'},
-                                fatal=False, expected_status=(401, 403, 404)) or {}
+        tok = _suno_json(ie, f'{base}/v1/client/sessions/{sid}/tokens', 'Getting a Suno login token',
+                         'login token', query=q, data=b'',
+                         headers={**h, 'Content-Type': 'application/x-www-form-urlencoded'}) or {}
         jwt = tok.get('jwt') or traverse_obj(resp, ('sessions', 0, 'last_active_token', 'jwt'))
         if jwt:
+            trail.append('logged in')
             ydl._suno_token = (jwt, time.time())
             return jwt
     ie.report_warning('Suno did not accept the login from your browser cookies')
@@ -144,9 +176,9 @@ def suno_api(ie, path, vid, note, token=None, query=None, json_body=None):
     if json_body is not None:
         data = json.dumps(json_body).encode()
         h['Content-Type'] = 'application/json'
+    step = path.strip('/').split('/')[1] + (' (logged in)' if token else '')
     for host in _SUNO_STUDIO:
-        res = ie._download_json(f'{host}{path}', vid, note, query=query, data=data, headers=h, fatal=False,
-                                expected_status=(400, 401, 403, 404, 405, 422))
+        res = _suno_json(ie, f'{host}{path}', note, step, query=query, data=data, headers=h)
         if res and not (isinstance(res, dict) and res.get('detail') and len(res) == 1):
             return res
     return None
@@ -171,6 +203,7 @@ class SunoIE(InfoExtractor):
                 raise ExtractorError('Could not find a song in this Suno link', expected=True)
             song_id = m.group(m.lastindex or 0)
 
+        self._downloader._suno_trail = []  # what happened, for this song's error message
         clip = suno_api(self, f'/api/clip/{song_id}', song_id, 'Downloading song info') or {}
         private = not clip.get('title') or not clip.get('audio_url')
         if private:
@@ -184,6 +217,9 @@ class SunoIE(InfoExtractor):
                                     query={'ids': song_id})
                     got = next((c for c in ((feed or {}).get('clips') if isinstance(feed, dict) else feed) or []
                                 if isinstance(c, dict) and c.get('id') == song_id), got)
+                if got and not got.get('audio_url'):
+                    self._downloader._suno_trail.append(
+                        f'found the song ({got.get("status") or "no status"}) but no audio link')
                 clip = got or clip
         meta = clip.get('metadata') or {}
 
@@ -196,6 +232,8 @@ class SunoIE(InfoExtractor):
                 formats.append({'format_id': 'mp3', 'url': a, 'ext': 'mp3',
                                 'vcodec': 'none', 'acodec': 'mp3', 'quality': 1})
                 break
+            self._downloader.__dict__.setdefault('_suno_trail', []).append(
+                f'audio file {a.split("/")[2]}: not available')
         video = url_or_none(clip.get('video_url')) or f'https://cdn1.suno.ai/{song_id}.mp4'
         if self._is_valid_url(video, song_id, 'MP4 video'):
             formats.append({'format_id': 'mp4', 'url': video, 'ext': 'mp4',
