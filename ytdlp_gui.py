@@ -2574,10 +2574,15 @@ class SearchWindow(tk.Toplevel):
         mid = ttk.Frame(outer)
         mid.pack(fill='both', expand=True, pady=8)
         ttk.Style(self).configure('Search.Treeview', rowheight=74)
-        self.tree = ttk.Treeview(mid, columns=('title', 'channel', 'length', 'views'), show='tree headings',
-                                 selectmode='extended', style='Search.Treeview')
+        self.tree = ttk.Treeview(mid, columns=('pick', 'title', 'channel', 'length', 'views'), show='tree headings',
+                                 selectmode='none', style='Search.Treeview')
         self.tree.heading('#0', text='')
         self.tree.column('#0', width=136, stretch=False)
+        self.tree.heading('pick', text='☐', command=self._toggle_all)
+        self.tree.column('pick', width=36, anchor='center', stretch=False)
+        self.tree.tag_configure('checked', background=p['select'])
+        self.tree.tag_configure('added', foreground=p['muted'])
+        self.checked, self.added, self._anchor = set(), set(), None
         for c, w, a in (('title', 420, 'w'), ('channel', 180, 'w'), ('length', 70, 'e'), ('views', 70, 'e')):
             self.tree.heading(c, text=c.capitalize())
             self.tree.column(c, width=w, anchor=a, stretch=(c == 'title'))
@@ -2585,26 +2590,27 @@ class SearchWindow(tk.Toplevel):
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side='left', fill='both', expand=True)
         sb.pack(side='right', fill='y')
-        self.tree.bind('<<TreeviewSelect>>', lambda e: self._update_count())
-        self.tree.bind('<Double-1>', lambda e: self._open_in_browser())
+        self.tree.bind('<Button-1>', self._click)
+        self.tree.bind('<Shift-Button-1>', lambda e: self._click(e, shift=True))
         self.tree.bind('<Button-3>', self._menu)
 
         bot = ttk.Frame(outer)
         bot.pack(fill='x')
         self.status = tk.StringVar(value='Type something and press Enter.')
         ttk.Label(bot, textvariable=self.status).pack(side='left')
-        self.btn_now = ttk.Button(bot, text='Download now', style='Accent.TButton', command=lambda: self._add(True),
-                                  state='disabled')
+        self.btn_now = ttk.Button(bot, text='Download checked', style='Accent.TButton',
+                                  command=lambda: self._add(True), state='disabled')
         self.btn_now.pack(side='right')
-        self.btn_add = ttk.Button(bot, text='Add to list', command=lambda: self._add(False), state='disabled')
+        self.btn_add = ttk.Button(bot, text='Add checked to list', command=lambda: self._add(False),
+                                  state='disabled')
         self.btn_add.pack(side='right', padx=6)
         self.btn_more = ttk.Button(bot, text='Load more', command=self.more, state='disabled')
         self.btn_more.pack(side='right', padx=(0, 12))
-        ttk.Button(bot, text='Select all', command=lambda: self.tree.selection_set(self.tree.get_children())).pack(
-            side='right')
+        self.btn_all = ttk.Button(bot, text='Check all', width=11, command=self._toggle_all)
+        self.btn_all.pack(side='right')
         ttk.Label(outer, style='Hint.TLabel',
-                  text='Click to select (Ctrl/Shift for several) · double-click opens it in your browser · '
-                       'right-click to preview or check formats').pack(anchor='w', pady=(6, 0))
+                  text='Click a result to tick it (Shift-click ticks everything in between) · '
+                       'right-click to preview, check formats or open in your browser').pack(anchor='w', pady=(6, 0))
         app._set_titlebar(self)
         ent.focus_set()
         self.after(60, self._pump)
@@ -2619,6 +2625,7 @@ class SearchWindow(tk.Toplevel):
             self.n = self.STEP
             self.tree.delete(*self.tree.get_children())
             self.results, self.images = [], {}
+            self.checked, self.added, self._anchor = set(), set(), None
         self._gen += 1
         gen, site, n, settings = self._gen, self.site.get(), self.n, self.app._collect()
         self.status.set(f'Searching {site} for "{q}"…')
@@ -2651,7 +2658,7 @@ class SearchWindow(tk.Toplevel):
                         i = str(len(self.results))
                         self.results.append(r)
                         self.tree.insert('', 'end', iid=i, text='', values=(
-                            r['title'], r['channel'], human_eta(r['duration']) if r['duration'] else '',
+                            '☐', r['title'], r['channel'], human_eta(r['duration']) if r['duration'] else '',
                             human_count(r['views'])))
                         if r['thumb']:
                             self._load_thumb(gen, i, r['thumb'])
@@ -2679,37 +2686,75 @@ class SearchWindow(tk.Toplevel):
         threading.Thread(target=work, daemon=True).start()
 
     def _selected(self):
-        return [self.results[int(i)] for i in self.tree.selection()]
+        return [self.results[int(i)] for i in sorted(self.checked, key=int)]
+
+    def _set_checked(self, iid, on):
+        if on:
+            self.checked.add(iid)
+        else:
+            self.checked.discard(iid)
+        self.tree.set(iid, 'pick', '☑' if on else ('✓' if iid in self.added else '☐'))
+        self.tree.item(iid, tags=('checked',) if on else (('added',) if iid in self.added else ()))
+
+    def _click(self, e, shift=False):
+        if self.tree.identify_region(e.x, e.y) == 'heading':
+            return  # let the ☐ header (check all) and column headings work
+        iid = self.tree.identify_row(e.y)
+        if not iid:
+            return 'break'
+        if shift and self._anchor is not None and self.tree.exists(self._anchor):
+            rows = list(self.tree.get_children())
+            a, b = sorted((rows.index(self._anchor), rows.index(iid)))
+            on = self._anchor in self.checked
+            for r in rows[a:b + 1]:
+                self._set_checked(r, on)
+        else:
+            self._set_checked(iid, iid not in self.checked)
+            self._anchor = iid
+        self._update_count()
+        return 'break'
+
+    def _toggle_all(self):
+        rows = self.tree.get_children()
+        on = len(self.checked) < len(rows)
+        for r in rows:
+            self._set_checked(r, on)
+        self._update_count()
 
     def _update_count(self):
-        n = len(self.tree.selection())
+        n, total = len(self.checked), len(self.tree.get_children())
         for b in (self.btn_add, self.btn_now):
             b.configure(state='normal' if n else 'disabled')
-        if n:
-            self.btn_add.configure(text=f'Add {n} to list')
+        self.btn_now.configure(text=f'Download {n} checked' if n else 'Download checked')
+        self.btn_add.configure(text=f'Add {n} to list' if n else 'Add checked to list')
+        everything = bool(total) and n == total
+        self.btn_all.configure(text='Uncheck all' if everything else 'Check all')
+        self.tree.heading('pick', text='☑' if everything else '☐')
 
     def _add(self, start):
-        urls = [r['url'] for r in self._selected()]
+        picked = sorted(self.checked, key=int)
+        urls = [self.results[int(i)]['url'] for i in picked]
         if not urls:
             return
         added = self.app._add_urls(urls, 'search')
-        self.status.set(f'Added {added} to the list' if added else 'Already in the list')
+        self.added.update(picked)
+        for i in picked:  # untick them, and mark them as already added
+            self._set_checked(i, False)
+        self._update_count()
+        what = f'{added} link{"s" if added != 1 else ""}'
         if start and not self.app._busy():
             self.app._start()
+            self.status.set(f'Downloading {what} — progress is in the main window' if added
+                            else 'Already in the list — downloading it now')
         elif start:
-            self.status.set('Added — downloads are already running; press Download when they finish')
-
-    def _open_in_browser(self):
-        sel = self._selected()
-        if sel:
-            __import__('webbrowser').open(sel[0]['url'])
+            self.status.set(f'Added {what} — downloads are already running; press Download when they finish')
+        else:
+            self.status.set(f'Added {what} to the list' if added else 'Already in the list')
 
     def _menu(self, e):
         iid = self.tree.identify_row(e.y)
         if not iid:
             return
-        if iid not in self.tree.selection():
-            self.tree.selection_set(iid)
         r = self.results[int(iid)]
         p = self.app.palette
         m = tk.Menu(self, tearoff=0, background=p['surface'], foreground=p['fg'],
