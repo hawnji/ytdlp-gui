@@ -69,6 +69,30 @@ SUNO_LOGIN_HELP = ('To get songs from your own Suno library (including unpublish
                    'Firefox works best — Chrome and Edge often lock their cookies while they are open.')
 
 
+def _suno_client_cookie(ydl):
+    """The browser's Suno login cookie (Clerk's __client), or None if Grabbit wasn't given one."""
+    best = None
+    for c in ydl.cookiejar:
+        if c.name == '__client' and c.domain.lstrip('.').endswith('suno.com') and c.value:
+            if best is None or 'auth.' in c.domain:
+                best = c.value
+    return best
+
+
+def suno_login_problem(ie):
+    """A plain explanation of why we have no Suno login, for error messages."""
+    ydl = ie._downloader
+    if not ydl.params.get('cookiesfrombrowser'):
+        return '"Cookies from browser" is set to None, so Grabbit can\'t see your Suno login. ' + SUNO_LOGIN_HELP
+    browser = ydl.params['cookiesfrombrowser'][0]
+    if not _suno_client_cookie(ydl):
+        return (f'Grabbit read the cookies from {browser.title()} but found no Suno login in them. Make sure you are '
+                f'logged in to suno.com in {browser.title()} (not another browser or profile). If it is Chrome or '
+                'Edge, close it completely and try again, or use Firefox.')
+    return ('Your Suno login was found, but Suno refused it (it may have expired). Log out of suno.com and back '
+            'in, then try again.')
+
+
 def suno_token(ie):
     """A short-lived login token for the Suno account in the browser cookies Grabbit was given, or None.
     Suno uses Clerk for logins: the long-lived __client cookie is swapped for a token that lasts about a minute."""
@@ -76,23 +100,55 @@ def suno_token(ie):
     cached = getattr(ydl, '_suno_token', None)
     if cached and time.time() - cached[1] < 40:
         return cached[0]
-    q = {'_clerk_js_version': _SUNO_CLERK_JS}
+    client = _suno_client_cookie(ydl)
+    if not client:
+        return None
+    q = {'__clerk_api_version': '2025-11-10', '_clerk_js_version': _SUNO_CLERK_JS}
+    h = {**_SUNO_HEADERS, 'Authorization': client}
     for base in _SUNO_CLERK:
         data = ie._download_json(f'{base}/v1/client', None, 'Checking your Suno login', query=q,
-                                 headers=_SUNO_HEADERS, fatal=False, expected_status=(401, 403, 404)) or {}
+                                 headers=h, fatal=False, expected_status=(401, 403, 404)) or {}
         resp = data.get('response') or {}
         sid = resp.get('last_active_session_id') or traverse_obj(resp, ('sessions', 0, 'id'))
         if not sid:
             continue
         tok = ie._download_json(f'{base}/v1/client/sessions/{sid}/tokens', None, 'Getting a Suno login token',
                                 query=q, data=b'',
-                                headers={**_SUNO_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded'},
-                                fatal=False,
-                                expected_status=(401, 403, 404)) or {}
+                                headers={**h, 'Content-Type': 'application/x-www-form-urlencoded'},
+                                fatal=False, expected_status=(401, 403, 404)) or {}
         jwt = tok.get('jwt') or traverse_obj(resp, ('sessions', 0, 'last_active_token', 'jwt'))
         if jwt:
             ydl._suno_token = (jwt, time.time())
             return jwt
+    ie.report_warning('Suno did not accept the login from your browser cookies')
+    return None
+
+
+_SUNO_STUDIO = ('https://studio-api.prod.suno.com', 'https://studio-api-prod.suno.com')
+
+
+def suno_api(ie, path, vid, note, token=None, query=None, json_body=None):
+    """Call Suno's studio API (logged in if token is given), trying both of its host names. None on failure."""
+    import base64
+    import uuid
+    ydl = ie._downloader
+    h = dict(_SUNO_HEADERS)
+    if token:
+        if not getattr(ydl, '_suno_device', None):
+            ydl._suno_device = next((c.value for c in ydl.cookiejar if c.name == 'ajs_anonymous_id'
+                                     and 'suno' in c.domain), None) or str(uuid.uuid4())
+        stamp = base64.b64encode(json.dumps({'timestamp': int(time.time() * 1000)}).encode()).decode()
+        h.update({'Authorization': f'Bearer {token}', 'device-id': ydl._suno_device.strip('"%22'),
+                  'browser-token': json.dumps({'token': stamp})})
+    data = None
+    if json_body is not None:
+        data = json.dumps(json_body).encode()
+        h['Content-Type'] = 'application/json'
+    for host in _SUNO_STUDIO:
+        res = ie._download_json(f'{host}{path}', vid, note, query=query, data=data, headers=h, fatal=False,
+                                expected_status=(400, 401, 403, 404, 405, 422))
+        if res and not (isinstance(res, dict) and res.get('detail') and len(res) == 1):
+            return res
     return None
 
 
@@ -115,15 +171,20 @@ class SunoIE(InfoExtractor):
                 raise ExtractorError('Could not find a song in this Suno link', expected=True)
             song_id = m.group(m.lastindex or 0)
 
-        clip = self._download_json(self._API + song_id, song_id, 'Downloading song info', fatal=False,
-                                   expected_status=(401, 403, 404)) or {}
-        if not clip.get('title') or not clip.get('audio_url'):
+        clip = suno_api(self, f'/api/clip/{song_id}', song_id, 'Downloading song info') or {}
+        private = not clip.get('title') or not clip.get('audio_url')
+        if private:
             # unpublished songs only show their details to the owner: ask again logged in, if we can
             token = suno_token(self)
             if token:
-                clip = self._download_json(self._API + song_id, song_id, 'Downloading song info (logged in)',
-                                           headers={**_SUNO_HEADERS, 'Authorization': f'Bearer {token}'},
-                                           fatal=False, expected_status=(401, 403, 404)) or clip
+                got = (suno_api(self, f'/api/clip/{song_id}', song_id, 'Downloading song info (logged in)', token)
+                       or {})
+                if not got.get('audio_url'):
+                    feed = suno_api(self, '/api/feed/v2', song_id, 'Looking the song up in your library', token,
+                                    query={'ids': song_id})
+                    got = next((c for c in ((feed or {}).get('clips') if isinstance(feed, dict) else feed) or []
+                                if isinstance(c, dict) and c.get('id') == song_id), got)
+                clip = got or clip
         meta = clip.get('metadata') or {}
 
         formats = []
@@ -131,7 +192,7 @@ class SunoIE(InfoExtractor):
         if audio and 'forbidden' in audio:
             audio = None
         for a in dict.fromkeys(filter(None, (audio, f'https://cdn1.suno.ai/{song_id}.mp3'))):
-            if self._is_valid_url(a, song_id, 'MP3 audio'):
+            if (private and a == audio) or self._is_valid_url(a, song_id, 'MP3 audio'):
                 formats.append({'format_id': 'mp3', 'url': a, 'ext': 'mp3',
                                 'vcodec': 'none', 'acodec': 'mp3', 'quality': 1})
                 break
@@ -140,9 +201,9 @@ class SunoIE(InfoExtractor):
             formats.append({'format_id': 'mp4', 'url': video, 'ext': 'mp4',
                             'vcodec': 'h264', 'acodec': 'aac', 'quality': 0})
         if not formats:
-            raise ExtractorError('Suno did not offer a downloadable file for this song '
-                                 '(it may be private, deleted or still generating). If it is one of yours: '
-                                 + SUNO_LOGIN_HELP, expected=True)
+            raise ExtractorError('Suno did not offer a downloadable file for this song (it may be private, deleted '
+                                 'or still generating). If it is one of yours: ' + suno_login_problem(self),
+                                 expected=True)
 
         title = clip.get('title')
         if not title:
@@ -248,17 +309,23 @@ class SunoLibraryIE(InfoExtractor):
     Links: suno.com/me, suno.com/library, suno.com/create (the pages Suno shows your songs on)."""
     IE_NAME = 'suno:library'
     _VALID_URL = r'https?://(?:www\.|app\.)?suno\.com/(?P<id>me|library|create)/?(?:[?#].*)?$'
-    _FEED = 'https://studio-api.prod.suno.com/api/feed/v2'
 
     def _real_extract(self, url):
         entries, seen, total = [], set(), None
         for page in range(0, 500):
             token = suno_token(self)  # tokens only last about a minute, so refresh as we go
             if not token:
-                raise ExtractorError(SUNO_LOGIN_HELP, expected=True)
-            data = self._download_json(
-                self._FEED, 'library', f'Downloading your song list, page {page + 1}', query={'page': page},
-                headers={**_SUNO_HEADERS, 'Authorization': f'Bearer {token}'})
+                if page == 0:
+                    raise ExtractorError(suno_login_problem(self), expected=True)
+                break
+            note = f'Downloading your song list, page {page + 1}'
+            data = (suno_api(self, '/api/feed/v3', 'library', note, token, json_body={'page': page})
+                    or suno_api(self, '/api/feed/v2', 'library', note, token, query={'page': page}))
+            if data is None:
+                if page == 0:
+                    raise ExtractorError('Suno would not send your song list. ' + suno_login_problem(self),
+                                         expected=True)
+                break
             clips = data.get('clips') if isinstance(data, dict) else data
             new = [c for c in clips or [] if isinstance(c, dict) and c.get('id') and c['id'] not in seen]
             for c in new:
@@ -269,7 +336,10 @@ class SunoLibraryIE(InfoExtractor):
                     f'https://suno.com/song/{c["id"]}', SunoIE, c['id'], c.get('title'),
                     duration=float_or_none((c.get('metadata') or {}).get('duration')),
                     uploader=c.get('display_name')))
-            total = (data.get('num_total_results') if isinstance(data, dict) else None) or total
+            if isinstance(data, dict):
+                total = data.get('num_total_results') or total
+                if data.get('has_more') is False:
+                    break
             if not new or (total and len(seen) >= total):
                 break
         if not entries:
