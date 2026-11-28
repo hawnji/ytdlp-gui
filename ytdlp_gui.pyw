@@ -2743,10 +2743,27 @@ def _pick_thumb(thumbs):
     return (min(sized, key=lambda t: abs(t['width'] - 300)) if sized else thumbs[-1])['url']
 
 
+def _entry_date(e):
+    """When a result was uploaded, as YYYY-MM-DD ('' if the site doesn't say)."""
+    d = e.get('upload_date') or e.get('release_date')
+    if d and len(str(d)) == 8:
+        d = str(d)
+        return f'{d[:4]}-{d[4:6]}-{d[6:]}'
+    ts = e.get('timestamp') or e.get('release_timestamp')
+    if ts:
+        try:
+            return time.strftime('%Y-%m-%d', time.gmtime(ts))
+        except (ValueError, OverflowError, OSError):
+            pass
+    return ''
+
+
 def run_search(site, query, n, settings):
     """Up to n results for a search: [{'url', 'id', 'title', 'channel', 'duration', 'views', 'thumb'}]."""
     target = SEARCH_SITES[site](query, n)
     opts = dict(yt_dlp.parse_options(build_args({**settings, 'clip_start': '', 'clip_end': ''})).ydl_opts)
+    # approximate_date: YouTube only says "3 weeks ago" in search results; this turns that into a date
+    opts['extractor_args'] = {**(opts.get('extractor_args') or {}), 'youtubetab': {'approximate_date': ['']}}
     opts.update(extract_flat='in_playlist', playlistend=n, quiet=True, no_warnings=True, skip_download=True,
                 noplaylist=False, logger=GuiLogger(queue.Queue()), postprocessors=[])
     for k in ('download_ranges', 'download_archive', 'sleep_interval', 'max_sleep_interval'):
@@ -2770,6 +2787,7 @@ def run_search(site, query, n, settings):
             'url': url, 'id': vid, 'title': e.get('title') or url,
             'channel': e.get('channel') or e.get('uploader') or traverse_obj(e, ('artists', 0)) or '',
             'duration': e.get('duration'), 'views': e.get('view_count'), 'thumb': thumb,
+            'date': _entry_date(e),
         })
         if len(results) >= n:
             break
@@ -2810,7 +2828,7 @@ def human_count(n):
 
 class SearchWindow(tk.Toplevel):
     """Search a site, tick results and add them to the download list."""
-    STEP, MAX = 20, 200
+    STEP, MAX = 50, 300
 
     def __init__(self, app, query='', site='YouTube'):
         super().__init__(app)
@@ -2863,7 +2881,8 @@ class SearchWindow(tk.Toplevel):
         mid = ttk.Frame(outer)
         mid.pack(fill='both', expand=True, pady=8)
         ttk.Style(self).configure('Search.Treeview', rowheight=74)
-        self.tree = ttk.Treeview(mid, columns=('pick', 'title', 'channel', 'length', 'views'), show='tree headings',
+        self.tree = ttk.Treeview(mid, columns=('pick', 'title', 'channel', 'added', 'length', 'views'),
+                                 show='tree headings',
                                  selectmode='none', style='Search.Treeview', height=5)
         self.tree.heading('#0', text='')
         self.tree.column('#0', width=136, stretch=False)
@@ -2873,7 +2892,8 @@ class SearchWindow(tk.Toplevel):
         self.tree.tag_configure('added', foreground=p['muted'])
         self.checked, self.added, self._anchor = set(), set(), None
         self._sort = (None, False)  # (column, descending); None = the site's own order
-        for c, w, a in (('title', 420, 'w'), ('channel', 180, 'w'), ('length', 70, 'e'), ('views', 70, 'e')):
+        for c, w, a in (('title', 380, 'w'), ('channel', 160, 'w'), ('added', 90, 'center'), ('length', 70, 'e'),
+                        ('views', 70, 'e')):
             self.tree.heading(c, text=c.capitalize(), command=lambda c=c: self._sort_by(c))
             self.tree.column(c, width=w, anchor=a, stretch=(c == 'title'))
         sb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
@@ -2931,7 +2951,8 @@ class SearchWindow(tk.Toplevel):
                         i = str(len(self.results))
                         self.results.append(r)
                         self.tree.insert('', 'end', iid=i, text='', values=(
-                            '☐', r['title'], r['channel'], human_eta(r['duration']) if r['duration'] else '',
+                            '☐', r['title'], r['channel'], r.get('date', ''),
+                            human_eta(r['duration']) if r['duration'] else '',
                             human_count(r['views'])))
                         if r['thumb']:
                             self._load_thumb(gen, i, r['thumb'])
@@ -2966,6 +2987,7 @@ class SearchWindow(tk.Toplevel):
     _SORT_KEYS = {
         'title': lambda r: (r['title'] or '').casefold(),
         'channel': lambda r: (r['channel'] or '').casefold(),
+        'added': lambda r: r.get('date') or '',
         'length': lambda r: r['duration'] or 0,
         'views': lambda r: r['views'] or 0,
     }
@@ -2974,7 +2996,7 @@ class SearchWindow(tk.Toplevel):
         """Click a heading: sort by it; click again to flip; a third time goes back to the site's order.
         Numbers start biggest-first (most views, longest), text starts A→Z."""
         cur, desc = self._sort
-        first_desc = col in ('length', 'views')
+        first_desc = col in ('added', 'length', 'views')  # newest / longest / most viewed first
         if cur != col:
             self._sort = (col, first_desc)
         elif desc == first_desc:
